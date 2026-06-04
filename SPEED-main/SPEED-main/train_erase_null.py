@@ -42,17 +42,17 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, b
     elif args.params == 'K':
         edit_dict = {k: v for k, v in pipeline.unet.state_dict().items() if 'attn2.to_k' in k}
 
-    if baseline in ['SPEED']:
-        null_inputs = get_token_id('', pipeline.tokenizer, return_ids_only=False)
-        null_hidden = pipeline.text_encoder(null_inputs.input_ids.to(device)).last_hidden_state[0]
-        cluster_ids, cluster_centers = kmeans(X=null_hidden[1:], num_clusters=3, distance='euclidean', device='cuda')
+    if baseline in ['SPEED']:#AIC
+        null_inputs = get_token_id('', pipeline.tokenizer, return_ids_only=False)#将空字符串 "" 送进 tokenizer
+        null_hidden = pipeline.text_encoder(null_inputs.input_ids.to(device)).last_hidden_state[0]#空prompt每个token都得到了编码
+        cluster_ids, cluster_centers = kmeans(X=null_hidden[1:], num_clusters=3, distance='euclidean', device='cuda')#提炼出几个代表性的空语义方向
         K2 = torch.cat([null_hidden[[0], :], cluster_centers.to(device)], dim=0).T
         I2 = torch.eye(len(K2.T), device=device)
     else:
-        raise ValueError("Invalid baseline")
+        raise ValueError("Invalid baseline")#1.选出了要修改的Unet权重层，存入了edit_dict 2.构造了所需的空prompt参考矩阵
 
     # region [Target and Anchor]
-    sum_anchor_target, sum_target_target = [], []
+    sum_anchor_target, sum_target_target = [], []#把“删谁”和“往哪推”这两个自然语言目标，编码成两个 768 x 768 的矩阵，供后面每一层权重更新时使用
     for i in range(0, len(target_concepts)):
         target_inputs = get_token_id(target_concepts[i], pipeline.tokenizer, return_ids_only=False)
         target_embs = pipeline.text_encoder(target_inputs.input_ids.to(device)).last_hidden_state[0]
@@ -61,8 +61,8 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, b
         if target_concepts == ['nudity']:
             target_embs = target_embs[1:, :]  # all tokens
             anchor_embs = anchor_embs[1:, :]  # all tokens
-        else:
-            target_embs = target_embs[[(target_inputs.attention_mask[0].sum().item() - 2)], :]  # last subject token
+        else:#只取 target 文本里最后一个有效主体 token 的 embedding 作为这个概念的代表向量
+            target_embs = target_embs[[(target_inputs.attention_mask[0].sum().item() - 2)], :]  # last subject token    最后一个内容 token 往往已经通过自注意力看过前面的 token，因此更像整段概念的汇总表示
             anchor_embs = anchor_embs[[(anchor_inputs.attention_mask[0].sum().item() - 2)], :]  # last subject token
         sum_target_target.append(target_embs.T @ target_embs)
         sum_anchor_target.append(anchor_embs.T @ target_embs)
