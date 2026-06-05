@@ -160,7 +160,7 @@ if __name__ == '__main__':
             file_suffix += f'-to_{anchor_concepts[0]}'
     else:
         assert len(target_concepts) == len(anchor_concepts)
-        file_suffix += f'-to_{anchor_concepts[0]}_etc'
+        file_suffix += f'-to_{anchor_concepts[0]}_etc'#使输入格式统一，保存的文件名更可读
 
     retain_texts = []
     if retain_path is not None:
