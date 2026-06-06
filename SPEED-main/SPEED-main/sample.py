@@ -20,7 +20,7 @@ def diffusion(unet, scheduler, latents, text_embeddings, total_timesteps, start_
     scheduler.set_timesteps(total_timesteps)
     for timestep in tqdm(scheduler.timesteps[start_timesteps: total_timesteps], desc=desc):
 
-        latent_model_input = torch.cat([latents] * 2)
+        latent_model_input = torch.cat([latents] * 2)#一半用于无条件分支，一般用于有条件
         latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
 
         # predict the noise residual
@@ -85,7 +85,7 @@ def main():
     pipe = DiffusionPipeline.from_pretrained(args.sd_ckpt, safety_checker=None, torch_dtype=torch.float16).to('cuda')
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     unet, tokenizer, text_encoder, vae = pipe.unet, pipe.tokenizer, pipe.text_encoder, pipe.vae
-    if 'edit' in mode_list:
+    if 'edit' in mode_list:#只替换unet权重
         unet_edit = copy.deepcopy(unet)
         edit_path = args.edit_ckpt or os.path.join("logs/checkpoints", sorted(os.listdir("logs/checkpoints"))[-1])
         unet_edit.load_state_dict(torch.load(edit_path, map_location='cpu'), strict=False)
@@ -99,7 +99,7 @@ def main():
         prompt_list = [[x.format(concept) for x in template_dict[args.erase_type]] for concept in concept_list]
     else:
         prompt_list = [[x.format(concept) for x in args.prompts.split(';')] for concept in concept_list]
-    for i in range(int(args.num_samples // bs)):
+    for i in range(int(args.num_samples // bs)):#采样循环
         latent = torch.randn(bs, 4, 64, 64).to(pipe.device, dtype=pipe.dtype)
         for concept, prompts in zip(concept_list, prompt_list):
             for count, prompt in enumerate(prompts):
@@ -126,7 +126,7 @@ def main():
                 for mode in mode_list: os.makedirs(os.path.join(save_path, mode), exist_ok=True)
                 if len(mode_list) > 1: os.makedirs(os.path.join(save_path, 'combine'), exist_ok=True)
 
-                # Decode and process images
+                # Decode and process images 把 UNet 采样得到的 latent 变成真正可保存的 RGB 图像。
                 decoded_imgs = {
                     name: [process_img(vae.decode(img.unsqueeze(0) / vae.config.scaling_factor, return_dict=False)[0]) for img in img_list]
                     for name, img_list in save_images.items()
