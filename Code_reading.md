@@ -2,42 +2,69 @@
 
 ## `train_erase_null.py`
 
+### 整体作用
+
+这份代码不是传统意义上的“训练”，而是根据 `target / anchor / retain` 的文本语义，直接编辑 Stable Diffusion 的部分 UNet 权重，并保存成一个 `.pt` 文件。
+
 ### `get_token_id`
 
-将文本转换为 token id 形式。
+将文本转换为 token id 形式，并返回 `input_ids` 或完整 tokenizer 输出。
+
+关键作用：
+
+1. 把字符串 prompt 变成模型能处理的 token。
+2. 支持单个文本，也支持一批文本。
+3. 后续 target、anchor、retain 都要先经过这一步。
 
 ### `generate_perturbed_embs()`
 
-DPA 模块功能：对 retain 施加定向噪声，增强语义。
+DPA 模块功能：对 retain embedding 施加定向噪声扰动，扩充 retain 语义样本。
 
 关键步骤：
-1. 用 `noise @ P` 把噪声限制到某个特定子空间。
+
+1. 用 `noise @ P` 把随机噪声限制到某个特定子空间。
 2. `perturbed_embs = mini_ret_embs + noise @ P` 得到扰动后的 embedding。
-3. `torch.matmul(perturbed_embs, erase_weight.T).norm(dim=1)` 计算扰动样本在当前擦除方向上的响应强度，只保留响应强于平均值的样本。
+3. `torch.matmul(perturbed_embs, erase_weight.T).norm(dim=1)` 计算扰动样本在当前擦除方向上的响应强度。
+4. 只保留响应高于平均值的扰动样本，用来增强 retain 集的代表性。
 
 ### `edit_model()`
 
-根据文本 embedding 和矩阵公式编辑权重部分。
+根据 target、anchor、retain 的文本 embedding 和 SPEED 的矩阵公式，直接计算并修改 UNet 的部分权重。
 
 关键步骤：
-1. 选择要编辑哪些权重层，由 `args.params` 决定修改 `KV`、`K`、`V`。
-2. IEC：对除第一个 token 外的 embedding 做 kmeans 聚类，将第一个 token embedding 和三个聚类中心拼成 `K2`，用于约束擦除过程不要偏移。
-3. 构造 target 和 anchor 的矩阵。
-4. 构造 retain 集 embedding。
-5. 对每一层计算擦除更新量：
-   - 首先计算初始方向。
-   - 然后 SVD 分解权重，得到当前层权重最小奇异值对应的方向，构造投影矩阵 `P0`，这个方向会用于 DPA。
-   - 接着求保留子空间，对 `sum_ret_ret` 做 SVD，奇异值小于阈值的方向组成投影矩阵 `P`。
-   - 最后解出 `delta_weight`。
+
+1. 选择要编辑哪些权重层，由 `args.params` 决定修改 `KV`、`K` 或 `V`。
+2. IEC：对空 prompt 的 embedding 做编码，再对除第一个 token 外的 embedding 做 kmeans 聚类，将第一个 token embedding 和三个聚类中心拼成 `K2`，用于约束编辑过程不要偏移过大。
+3. 构造 target 和 anchor 的矩阵：
+   - 将目标概念和锚点概念分别编码。
+   - 提取关键 token 的 embedding。
+   - 组成 target-target 和 anchor-target 的统计矩阵。
+4. 构造 retain 集 embedding：
+   - 从 csv 中读取保留概念文本。
+   - 去掉和 target 重复的项。
+   - 编码成 retain 的文本向量。
+5. 对每一层计算更新量：
+   - 先计算初始擦除方向 `erase_weight`。
+   - 然后 SVD 分解当前层权重，得到最小奇异值对应方向，构造投影矩阵 `P0_min`，用于 DPA 扰动。
+   - 接着对 retain 统计矩阵 `sum_ret_ret` 做 SVD，奇异值小于阈值的方向组成保留子空间投影矩阵 `P`。
+   - 最后按 SPEED 公式解出 `delta_weight`。
+6. 用 `layer_weight + delta_weight` 得到编辑后的权重，并写回 `edit_dict`。
 
 ### 主程序入口
 
 关键步骤：
 
-1. 定义基础参数等。
-2. 解析 target 和 anchor，控制输入和输出文件格式。
-3. 构造 `retain_texts`，从 csv 中读取，并加载扩散模型 SD1.4。
-4. 执行模型编辑。
+1. 定义基础参数、擦除参数和超参数。
+2. 解析 `target_concepts` 和 `anchor_concepts`，统一成列表格式，并构造输出文件名。
+3. 构造 `retain_texts`：
+   - 从 `retain_path` 指定的 csv 中读取。
+   - 用 `heads` 指定读取哪一列。
+4. 加载 Stable Diffusion v1.4：
+   - `tokenizer`
+   - `text_encoder`
+   - `unet`
+5. 调用 `edit_model()` 执行模型编辑。
+6. 将编辑后的权重保存为 `.pt` 文件，默认保存在 `logs/checkpoints/` 下。
 
 ## `sample.py`
 

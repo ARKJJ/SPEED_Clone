@@ -143,7 +143,7 @@ def main():
                     img_combined.save(os.path.join(save_path, 'combine', save_filename.replace('.png', '.jpg')))
 
 
-class AdaDataset(Dataset):
+class AdaDataset(Dataset):#三种格式不同的 CSV 统一包装成同一种样本字典
     def __init__(self, data_path, seed=None, guidance_scale=None, max_num=100000):
         self.data_path = data_path
         self.data = pd.read_csv(data_path)
