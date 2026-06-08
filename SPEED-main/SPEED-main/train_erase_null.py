@@ -16,7 +16,7 @@ def get_token_id(prompt, tokenizer=None, return_ids_only=True):
     return token_ids.input_ids if return_ids_only else token_ids
 
 
-def generate_perturbed_embs(ret_embs, P, erase_weight, num_per_sample, mini_batch=8):
+def generate_perturbed_embs(ret_embs, P, erase_weight, num_per_sample, mini_batch=8):#DPA
     ret_embs = ret_embs.squeeze(1)
     out_embs, norm_list = [], []
     for i in range(0, ret_embs.size(0), mini_batch):
@@ -42,14 +42,14 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, b
     elif args.params == 'K':
         edit_dict = {k: v for k, v in pipeline.unet.state_dict().items() if 'attn2.to_k' in k}
 
-    if baseline in ['SPEED']:#AIC
+    if baseline in ['SPEED']:   #IEC
         null_inputs = get_token_id('', pipeline.tokenizer, return_ids_only=False)#将空字符串 "" 送进 tokenizer
         null_hidden = pipeline.text_encoder(null_inputs.input_ids.to(device)).last_hidden_state[0]#空prompt每个token都得到了编码
         cluster_ids, cluster_centers = kmeans(X=null_hidden[1:], num_clusters=3, distance='euclidean', device='cuda')#提炼出几个代表性的空语义方向
         K2 = torch.cat([null_hidden[[0], :], cluster_centers.to(device)], dim=0).T
         I2 = torch.eye(len(K2.T), device=device)
     else:
-        raise ValueError("Invalid baseline")#1.选出了要修改的Unet权重层，存入了edit_dict 2.构造了所需的空prompt参考矩阵
+        raise ValueError("Invalid baseline")
 
     # region [Target and Anchor]
     sum_anchor_target, sum_target_target = [], []#把“删谁”和“往哪推”这两个自然语言目标，编码成两个 768 x 768 的矩阵，供后面每一层权重更新时使用
@@ -82,7 +82,9 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, b
             last_subject_indices = ret_inputs.attention_mask.sum(1) - 2
             last_ret_embs.append(ret_embs[torch.arange(ret_embs.size(0)), last_subject_indices].unsqueeze(1))
     last_ret_embs = torch.cat(last_ret_embs)
-    last_ret_embs = last_ret_embs[torch.randperm(last_ret_embs.size(0))]  # shuffle
+    last_ret_embs = last_ret_embs[torch.randperm(last_ret_embs.size(0))]  # shuffle 因为后面每层更新时可能会按顺序分块用这些 retain 样本。打乱可以避免样本顺序带来偏差，让统计更均匀。
+
+
     # endregion
 
     for (layer_name, layer_weight) in tqdm(edit_dict.items(), desc="Model Editing"):
@@ -91,7 +93,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, b
         (U0, S0, V0) = torch.svd(layer_weight)
         P0_min = V0[:, -1:] @ V0[:, -1:].T
 
-        if args.aug_num > 0 and not args.disable_filter:
+        if args.aug_num > 0 and not args.disable_filter:    #IPF
             weight_norm_init = torch.matmul(last_ret_embs.squeeze(1), erase_weight.T).norm(dim=1)
             layer_ret_embs = last_ret_embs[weight_norm_init > weight_norm_init.mean()]
         else:
@@ -110,7 +112,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, b
 
         if baseline == 'SPEED':
             U, S, V = torch.svd(sum_ret_ret)
-            P = U[:, S < args.threshold] @ U[:, S < args.threshold].T
+            P = U[:, S < args.threshold] @ U[:, S < args.threshold].T   #null-Space
             M = (sum_target_target @ P + args.retain_scale * I).inverse()
             delta_weight = layer_weight @ (sum_anchor_target - sum_target_target) @ P @ (I - M @ K2 @ (K2.T @ P @ M @ K2 + args.lamb * I2).inverse() @ K2.T @ P) @ M
 
@@ -160,7 +162,7 @@ if __name__ == '__main__':
             file_suffix += f'-to_{anchor_concepts[0]}'
     else:
         assert len(target_concepts) == len(anchor_concepts)
-        file_suffix += f'-to_{anchor_concepts[0]}_etc'#使输入格式统一，保存的文件名更可读
+        file_suffix += f'-to_{anchor_concepts[0]}_etc'
 
     retain_texts = []
     if retain_path is not None:
