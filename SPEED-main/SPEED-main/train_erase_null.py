@@ -107,8 +107,8 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, b
                     [chunk_ret_embs, generate_perturbed_embs(chunk_ret_embs, P0_min, erase_weight, num_per_sample=args.aug_num)], dim=0
                 )
             valid_num += chunk_ret_embs.shape[0]
-            sum_ret_ret.append((chunk_ret_embs.transpose(1, 2) @ chunk_ret_embs).sum(0))
-        sum_ret_ret = torch.stack(sum_ret_ret, dim=0).sum(0) / valid_num
+            sum_ret_ret.append((chunk_ret_embs.transpose(1, 2) @ chunk_ret_embs).sum(0))#这些样本主要分布在哪些方向上
+        sum_ret_ret = torch.stack(sum_ret_ret, dim=0).sum(0) / valid_num#原始 retain 样本加上增广样本，估计一个当前层的 retain 特征分布矩阵
 
         if baseline == 'SPEED':
             U, S, V = torch.svd(sum_ret_ret)

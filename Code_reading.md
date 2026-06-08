@@ -1,136 +1,521 @@
-### Understanding of Code
+# Code Pipeline Understanding: SPEED Model Editing and Sampling
 
-## `train_erase_null.py`
+## 1. 整体任务目标
 
-### 整体作用
+这个仓库的核心不是重新训练一个完整的 Stable Diffusion，而是把“概念擦除”理解成一次直接的权重编辑任务。`train_erase_null.py` 读取 `target / anchor / retain` 文本语义，直接修改 Stable Diffusion UNet 中 cross-attention 的部分权重，输出一个只包含编辑后权重的 `.pt` 文件；`sample.py` 再加载这个 edited checkpoint，在相同 prompt 和相同初始 latent 条件下，对比原始模型和编辑模型的生成结果。
 
-这份代码不是传统意义上的“训练”，而是根据 `target / anchor / retain` 的文本语义，直接编辑 Stable Diffusion 的部分 UNet 权重，并保存成一个 `.pt` 文件。
+换句话说，整条流程可以分成两个阶段：
 
-### `get_token_id`
+1. 编辑阶段：把文本语义约束转成 UNet 权重更新。
+2. 验证阶段：加载编辑后的 UNet，与原始模型做公平采样对比。
 
-将文本转换为 token id 形式，并返回 `input_ids` 或完整 tokenizer 输出。
+## 2. 模块化代码理解
 
-关键作用：
+### 模块 1：参数与任务配置模块
 
-1. 把字符串 prompt 变成模型能处理的 token。
-2. 支持单个文本，也支持一批文本。
-3. 后续 target、anchor、retain 都要先经过这一步。
+**模块作用**
 
-### `generate_perturbed_embs()`
+这是整个 pipeline 的入口。它负责把用户从命令行传入的擦除任务、保留集、采样模式和保存路径，整理成后续模块可直接使用的标准化配置。
 
-DPA 模块功能：对 retain embedding 施加定向噪声扰动，扩充 retain 语义样本。
+**对应代码**
 
-关键步骤：
+- `train_erase_null.py`
+  - `argparse` 参数定义
+  - `target_concepts = [con.strip() for con in args.target_concepts.split(',')]`
+  - `anchor_concepts = [x.strip() for x in anchor_concepts.split(',')]`
+  - `retain_path`, `heads`, `params`, `aug_num`, `threshold`, `retain_scale`, `lamb`
+  - `file_suffix`、`save_path`、`file_name` 的构造
+- `sample.py`
+  - `argparse` 参数定义
+  - `mode_list = args.mode.replace(' ', '').split(',')`
+  - `concept_list_tmp = [item.strip() for item in args.contents.split(',')]`
+  - `edit_path = args.edit_ckpt or os.path.join("logs/checkpoints", sorted(os.listdir("logs/checkpoints"))[-1])`
 
-1. 用 `noise @ P` 把随机噪声限制到某个特定子空间。
-2. `perturbed_embs = mini_ret_embs + noise @ P` 得到扰动后的 embedding。
-3. `torch.matmul(perturbed_embs, erase_weight.T).norm(dim=1)` 计算扰动样本在当前擦除方向上的响应强度。
-4. 只保留响应高于平均值的扰动样本，用来增强 retain 集的代表性。
+**输入输出**
 
-### `edit_model()`
+- 输入
+  - 用户命令行传入的 `target_concepts`、`anchor_concepts`、`retain_path`、`heads`
+  - 编辑超参数 `params / aug_num / threshold / retain_scale / lamb`
+  - 采样参数 `mode / total_timesteps / guidance_scale / num_samples / batch_size`
+  - 模型路径 `sd_ckpt` 和编辑权重路径 `edit_ckpt`
+- 输出
+  - 标准化后的 `target_concepts` 列表
+  - 与之对齐的 `anchor_concepts` 列表
+  - `retain_texts`
+  - 要编辑的权重类型设置 `args.params`
+  - checkpoint 保存路径和采样输出路径
 
-根据 target、anchor、retain 的文本 embedding 和 SPEED 的矩阵公式，直接计算并修改 UNet 的部分权重。
+**与其他模块的关系**
 
-关键步骤：
+这个模块决定后面所有模块“读什么、改什么、存到哪里”。尤其重要的是：
 
-1. 选择要编辑哪些权重层，由 `args.params` 决定修改 `KV`、`K` 或 `V`。
-2. IEC：对空 prompt 的 embedding 做编码，再对除第一个 token 外的 embedding 做 kmeans 聚类，将第一个 token embedding 和三个聚类中心拼成 `K2`，用于约束编辑过程不要偏移过大。
-3. 构造 target 和 anchor 的矩阵：
-   - 将目标概念和锚点概念分别编码。
-   - 提取关键 token 的 embedding。
-   - 组成 target-target 和 anchor-target 的统计矩阵。
-4. 构造 retain 集 embedding：
-   - 从 csv 中读取保留概念文本。
-   - 去掉和 target 重复的项。
-   - 编码成 retain 的文本向量。
-5. 对每一层计算更新量：
-   - 先计算初始擦除方向 `erase_weight`。
-   - 然后 SVD 分解当前层权重，得到最小奇异值对应方向，构造投影矩阵 `P0_min`，用于 DPA 扰动。
-   - 接着对 retain 统计矩阵 `sum_ret_ret` 做 SVD，奇异值小于阈值的方向组成保留子空间投影矩阵 `P`。
-   - 最后按 SPEED 公式解出 `delta_weight`。
-6. 用 `layer_weight + delta_weight` 得到编辑后的权重，并写回 `edit_dict`。
+- `args.params` 决定 UNet 权重更新模块到底编辑 `K`、`V` 还是 `KV`。
+- `retain_path + heads` 决定 retain 文本从哪个 CSV、哪几列读取。
+- `edit_ckpt` 把 `train_erase_null.py` 的输出连接到 `sample.py` 的输入。
 
-### 主程序入口
+### 模块 2：文本编码模块
 
-关键步骤：
+**模块作用**
 
-1. 定义基础参数、擦除参数和超参数。
-2. 解析 `target_concepts` 和 `anchor_concepts`，统一成列表格式，并构造输出文件名。
-3. 构造 `retain_texts`：
-   - 从 `retain_path` 指定的 csv 中读取。
-   - 用 `heads` 指定读取哪一列。
-4. 加载 Stable Diffusion v1.4：
-   - `tokenizer`
-   - `text_encoder`
-   - `unet`
-5. 调用 `edit_model()` 执行模型编辑。
-6. 将编辑后的权重保存为 `.pt` 文件，默认保存在 `logs/checkpoints/` 下。
+这个模块把自然语言 prompt 转成 Stable Diffusion 可以使用的 token ids 和 text embeddings。编辑阶段和采样阶段都依赖这一步，因为概念擦除本质上是“根据文本语义来改权重”，采样对比本质上是“根据文本语义来生成图像”。
 
-## `sample.py`
+**对应代码**
 
-### 文件作用
+- `train_erase_null.py`
+  - `get_token_id(prompt, tokenizer=None, return_ids_only=True)`
+  - `pipeline.tokenizer(...)`
+  - `pipeline.text_encoder(...).last_hidden_state`
+  - target / anchor / retain / empty prompt 的编码过程都在 `edit_model()` 中
+- `sample.py`
+  - `src.utils.get_token`
+  - `src.utils.get_textencoding`
+  - `uncond_embedding = get_textencoding(get_token('', tokenizer), text_encoder)`
+  - `embedding = get_textencoding(get_token(prompt, tokenizer), text_encoder)`
 
-这份代码负责对原始 Stable Diffusion 和编辑后的 UNet 进行采样，并把生成结果保存下来用于对比。
+**输入输出**
 
-### `diffusion()`
+- 输入
+  - `target_concepts`
+  - `anchor_concepts`
+  - `retain_texts`
+  - 空 prompt `''`
+  - 采样 prompt
+- 输出
+  - target embedding
+  - anchor embedding
+  - retain embedding
+  - unconditional embedding
+  - sampling conditional embedding
 
-扩散去噪过程，把随机噪声 latent 一步步变成最终图像 latent。
+**与其他模块的关系**
 
-关键步骤：
-1. latent 迭代去噪：从随机噪声开始，在每个时间步逐步减少噪声。
-2. 时间步机制：不同时间步对应不同噪声强度，前期决定整体结构，后期补充细节。
-3. CFG 机制：一次前向同时计算无条件和有条件预测，再组合得到更强的文本控制效果。
+- target / anchor / retain / empty prompt embedding 会进入编辑约束构造模块。
+- unconditional embedding 和 sampling prompt embedding 会进入采样对比模块中的 CFG 双分支。
 
-### 参数解析模块
+**代码实现上的关键点**
 
-读取命令行参数，控制采样方式、模型路径、输出目录以及测试概念。
+1. `get_token_id()` 和 `get_token()` 先把字符串 prompt 转成 token ids。
+2. `text_encoder(...)` 再把 token ids 转成 token 级别的隐向量表示。
+3. `train_erase_null.py` 对不同文本的取法不完全一样：
+   - `target` 和 `anchor` 通常取最后一个有效 token 的 embedding，作为概念代表向量。
+   - `nudity` 任务特判为使用全部非特殊 token。
+   - `retain` 文本默认也取最后一个有效 token。
+   - 空 prompt 用全部 token embedding，再进一步做 IEC 约束。
 
-关键步骤：
-1. 读取基础配置，如 `save_root`、`sd_ckpt`、`seed`。
-2. 读取采样配置，如 `mode`、`guidance_scale`、`total_timesteps`、`num_samples`、`batch_size`。
-3. 读取擦除任务配置，如 `erase_type`、`target_concept`、`contents`、`edit_ckpt`。
+### 模块 3：编辑约束构造模块
 
-### 概念筛选模块
+**模块作用**
 
-判断哪些 concept 需要重新采样，避免重复生成已经完整保存的结果。
+这是 `train_erase_null.py` 的核心前半部分。它负责把“删掉 target”“靠近 anchor”“尽量保留 retain”“不要让空语义漂移太大”这些自然语言目标，变成后面可直接作用于 UNet 权重的矩阵约束。
 
-关键步骤：
-1. 将 `contents` 拆成 concept 列表。
-2. 如果包含 `edit` 模式，就检查对应输出目录中的图片数量是否完整。
-3. 只有未采完的 concept 才会加入待处理列表。
+**对应代码**
 
-### 模型准备模块
+- `train_erase_null.py`
+  - `edit_model(...)`
+  - IEC 相关代码：
+    - `null_inputs = get_token_id('', ...)`
+    - `null_hidden = pipeline.text_encoder(...).last_hidden_state[0]`
+    - `cluster_ids, cluster_centers = kmeans(...)`
+    - `K2 = torch.cat([null_hidden[[0], :], cluster_centers.to(device)], dim=0).T`
+  - target / anchor 统计矩阵：
+    - `sum_target_target.append(target_embs.T @ target_embs)`
+    - `sum_anchor_target.append(anchor_embs.T @ target_embs)`
+  - retain 统计构造前的数据准备：
+    - `retain_texts = [text for text in retain_texts if not any(...)]`
+    - `last_ret_embs.append(...)`
 
-加载原始 Stable Diffusion，以及可选的编辑后 UNet。
+**输入输出**
 
-关键步骤：
-1. 原始模型与编辑模型并存：两者共用同一套 `tokenizer`、`text_encoder` 和 `vae`。
-2. 只替换 UNet 权重：说明编辑结果主要体现在 UNet 上，而不是整条 pipeline 都变化。
-3. 关闭 `safety checker`：避免外部安全过滤干扰实验评估，尤其是在 `nudity` 任务中。
+- 输入
+  - target embedding
+  - anchor embedding
+  - retain embedding
+  - empty prompt embedding
+  - 当前层原始权重 `layer_weight`
+- 输出
+  - `sum_target_target`
+  - `sum_anchor_target`
+  - retain 侧的 embedding 集合 `last_ret_embs`
+  - IEC 约束矩阵 `K2`
+  - 后续计算 `delta_weight` 所需的约束项
 
-### Prompt 构造模块
+**与其他模块的关系**
 
-把概念变成真正送给模型的文本条件。
+这个模块把文本语义变成矩阵形式，供 DPA 扰动增强模块和 UNet 权重更新模块使用。没有这一步，后面就无法把“语义上的擦除和保留目标”写进线性代数公式。
 
-关键步骤：
-1. 模板化测试：不是只测一句 prompt，而是用一组不同表达方式覆盖同一概念。
-2. 无条件 embedding：构造空 prompt 的 embedding，作为 CFG 的参照分支。
-3. 条件 embedding：把当前 prompt 编码成文本向量，作为真正的文本条件输入。
+**为什么这些约束都需要**
 
-### 采样主循环模块
+1. target / anchor 约束
+   - `sum_target_target` 表示目标概念自身的统计方向。
+   - `sum_anchor_target` 表示希望把 target 推向 anchor 的方向。
+   - 两者的差决定“擦除或重定向”的基本更新方向。
+2. retain 约束
+   - retain 集告诉模型哪些非目标概念能力要尽量保住。
+   - 它后面会被整理成 retain 子空间，用来限制更新不要破坏过多非目标语义。
+3. IEC 约束
+   - 空 prompt 编码出的 `null_hidden` 被聚成几个代表性方向，组成 `K2`。
+   - 其目的不是增强某个目标概念，而是约束编辑过程不要让基础语义空间整体漂移过大。
 
-逐批次、逐 concept、逐 prompt 调用 `diffusion()` 生成 latent 结果。
+### 模块 4：DPA 扰动增强模块
 
-关键步骤：
-1. 同一 latent 对比机制：原始模型和编辑模型使用同一份初始噪声，便于公平比较。
-2. CFG 双分支输入机制：把 latent 和 text embedding 都复制成无条件、有条件两路输入。
-3. 批量采样机制：一次处理 `batch_size` 张图，提高采样效率。
+**模块作用**
 
-### 解码与保存模块
+这是 retain 约束的增强模块。它不是直接修改权重，而是先扩展 retain 样本，使“应该被保留的语义”在编辑时更稳定、更有覆盖性。
 
-把 latent 变成真正图片，并按目录结构保存下来。
+**对应代码**
 
-关键步骤：
-1. VAE 解码机制：将潜空间中的 latent 还原为像素空间图像。
-2. 图像后处理：把模型输出从张量格式转成正常可保存的 PIL 图片。
-3. 结果组织：分别保存到 `original`、`edit` 和 `combine` 目录中，方便对比。
+- `train_erase_null.py`
+  - `generate_perturbed_embs(ret_embs, P, erase_weight, num_per_sample, mini_batch=8)`
+  - `noise = torch.randn_like(mini_ret_embs)`
+  - `perturbed_embs = mini_ret_embs + noise @ P`
+  - `torch.matmul(perturbed_embs, erase_weight.T).norm(dim=1)`
+  - `return out_embs[norm_list > norm_list.mean()].unsqueeze(1)`
+  - 在 `edit_model()` 中的调用：
+    - `P0_min = V0[:, -1:] @ V0[:, -1:].T`
+    - `chunk_ret_embs = torch.cat([chunk_ret_embs, generate_perturbed_embs(...)], dim=0)`
+
+**输入输出**
+
+- 输入
+  - retain embedding `chunk_ret_embs`
+  - 投影矩阵 `P0_min`
+  - 当前层的 `erase_weight`
+  - 扰动强度和样本数 `args.aug_num`
+- 输出
+  - 扰动后的 retain embeddings
+  - 增强后的 retain 样本集合
+
+**与其他模块的关系**
+
+它服务于 retain 约束构造和权重更新。增强后的 retain 样本会进入 `sum_ret_ret` 的统计计算，最终影响 `P` 和 `delta_weight`。
+
+**为什么要这样做**
+
+1. 为什么扰动 retain embedding
+   - 原始 retain 文本数量有限，直接统计可能不够稳。
+   - 加扰动可以让 retain 约束覆盖 retain 概念附近的一片局部语义区域。
+2. 为什么扰动限制在特定子空间
+   - `noise @ P0_min` 不是任意乱加噪声，而是投到当前层权重最弱响应的方向上。
+   - 这样做更像是在低响应子空间中做局部扩展，避免完全偏离 retain 语义。
+3. 为什么筛选响应强的扰动样本
+   - 代码用 `erase_weight` 测试扰动样本的响应强度，只保留高于平均值的样本。
+   - 这些样本更可能对“编辑时的保留约束”真正起作用。
+
+### 模块 5：UNet 权重更新模块
+
+**模块作用**
+
+这是 `train_erase_null.py` 的核心后半部分。前面模块只是把语义目标整理成矩阵，这个模块才真正把这些矩阵变成每一层 cross-attention 权重的实际更新量 `delta_weight`。
+
+**对应代码**
+
+- `train_erase_null.py`
+  - 选择可编辑层：
+    - `if args.params == 'KV'`
+    - `elif args.params == 'V'`
+    - `elif args.params == 'K'`
+  - 遍历每个要编辑的权重层：
+    - `for (layer_name, layer_weight) in tqdm(edit_dict.items(), desc="Model Editing")`
+  - 基础擦除方向：
+    - `erase_weight = layer_weight @ (sum_anchor_target - sum_target_target) @ (I + sum_target_target).inverse()`
+  - 当前层 SVD：
+    - `(U0, S0, V0) = torch.svd(layer_weight)`
+    - `P0_min = V0[:, -1:] @ V0[:, -1:].T`
+  - retain 统计：
+    - `sum_ret_ret.append((chunk_ret_embs.transpose(1, 2) @ chunk_ret_embs).sum(0))`
+    - `sum_ret_ret = torch.stack(...).sum(0) / valid_num`
+  - retain 子空间投影：
+    - `(U, S, V) = torch.svd(sum_ret_ret)`
+    - `P = U[:, S < args.threshold] @ U[:, S < args.threshold].T`
+  - 公式求解：
+    - `M = (sum_target_target @ P + args.retain_scale * I).inverse()`
+    - `delta_weight = ...`
+  - 写回结果：
+    - `edit_dict[layer_name] = layer_weight + delta_weight`
+
+**输入输出**
+
+- 输入
+  - 原始 UNet layer weight
+  - `sum_target_target`
+  - `sum_anchor_target`
+  - `sum_ret_ret`
+  - `K2`
+  - DPA 增强后的 retain embeddings
+  - `threshold / retain_scale / lamb / params`
+- 输出
+  - `delta_weight`
+  - edited layer weight
+  - 最终 `edit_dict`
+
+**与其他模块的关系**
+
+这个模块把“文本层面的语义编辑目标”真正转成“模型层面的参数变化”，它的输出随后进入 checkpoint 保存模块。
+
+**几个关键变量怎么理解**
+
+1. `edit_dict`
+   - 不是整个 UNet，而是被挑出来准备编辑的那部分权重字典。
+   - 按 `args.params` 只包含 cross-attention 的 `to_k`、`to_v` 或二者。
+2. `erase_weight`
+   - 可以把它理解成当前层对“target 到 anchor 的编辑目标”的基础响应方向。
+   - 它既参与初步筛选 retain 样本，也参与最终权重公式。
+3. `P`
+   - 来自 retain 统计矩阵的 SVD。
+   - 它把更新限制在 retain 相关的低奇异值子空间内，用于减少对非目标语义的破坏。
+4. `delta_weight`
+   - 这是最终真正加到当前层上的增量。
+   - 公式里同时融合了 target-anchor 编辑目标、retain 保留目标和 IEC 约束。
+
+### 模块 6：checkpoint 保存与加载模块
+
+**模块作用**
+
+这是连接 `train_erase_null.py` 和 `sample.py` 的桥梁。前半段负责把编辑结果存下来，后半段负责在采样时把这些修改过的 UNet 权重重新装入模型。
+
+**对应代码**
+
+- `train_erase_null.py`
+  - `save_path = args.save_path or "logs/checkpoints"`
+  - `file_name = args.file_name or f"{time.strftime('%Y%m%d-%H%M%S')}-{file_suffix}"`
+  - `torch.save(edit_dict, os.path.join(save_path, f"{file_name}.pt"))`
+- `sample.py`
+  - `unet_edit = copy.deepcopy(unet)`
+  - `edit_path = args.edit_ckpt or os.path.join("logs/checkpoints", sorted(os.listdir("logs/checkpoints"))[-1])`
+  - `unet_edit.load_state_dict(torch.load(edit_path, map_location='cpu'), strict=False)`
+
+**输入输出**
+
+- 输入
+  - `edit_dict`
+  - checkpoint 保存路径
+  - 采样阶段的 `edit_ckpt`
+- 输出
+  - `.pt` edited checkpoint
+  - 采样阶段加载好的 `unet_edit`
+
+**与其他模块的关系**
+
+- 前面模块解决“怎么改模型”。
+- 这一模块负责把编辑结果物化成可复用文件。
+- 后面的采样模块再用这个文件验证“改完以后生成会发生什么变化”。
+
+**为什么这里只替换 UNet 权重**
+
+代码里采样阶段并没有重建一套全新的编辑版 diffusion pipeline，而是：
+
+1. 先加载一个原始 `DiffusionPipeline`。
+2. 再 `copy.deepcopy(unet)` 得到 `unet_edit`。
+3. 只把 `.pt` 中保存的编辑后 UNet 权重载入 `unet_edit`。
+
+这说明 SPEED 的编辑对象主要是 UNet cross-attention 参数，而不是 tokenizer、text encoder、VAE 或 scheduler。
+
+### 模块 7：采样对比模块
+
+**模块作用**
+
+这是 `sample.py` 的核心模块。它负责在相同采样条件下分别调用原始 UNet 和编辑后 UNet，从而得到可以直接比较的生成结果。
+
+**对应代码**
+
+- `sample.py`
+  - `diffusion(...)`
+  - `pipe = DiffusionPipeline.from_pretrained(...)`
+  - `pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)`
+  - `prompt_list = [[x.format(concept) for x in template_dict[args.erase_type]] for concept in concept_list]`
+  - `latent = torch.randn(bs, 4, 64, 64).to(pipe.device, dtype=pipe.dtype)`
+  - `text_embeddings=torch.cat([uncond_embedding] * bs + [embedding] * bs, dim=0)`
+  - `save_images['original'] = diffusion(...)`
+  - `save_images['edit'] = diffusion(...)`
+- 依赖的共享辅助函数
+  - `src.utils.get_token`
+  - `src.utils.get_textencoding`
+  - `src.template.template_dict`
+
+**输入输出**
+
+- 输入
+  - original Stable Diffusion 的 `unet`
+  - edited UNet `unet_edit`
+  - sampling prompts
+  - unconditional / conditional embeddings
+  - 随机初始 latent
+  - scheduler 与采样超参数
+- 输出
+  - original image latent
+  - edited image latent
+
+**与其他模块的关系**
+
+它使用 checkpoint 模块提供的 `unet_edit`，再把生成得到的 latent 交给图像解码与保存模块。
+
+**代码里如何保证对比公平**
+
+1. 同一份初始 latent
+   - 在每个采样批次里先生成一次 `latent`。
+   - 后续 `original` 和 `edit` 都共用这同一份 latent。
+2. 同一份 prompt embedding
+   - `embedding` 是针对当前 prompt 只算一次。
+   - 原始模型和编辑模型都使用同一份条件 embedding。
+3. 同一 scheduler 和超参数
+   - 二者共用 `pipe.scheduler`、`guidance_scale`、`total_timesteps`。
+
+**`diffusion()` 在做什么**
+
+1. `scheduler.set_timesteps(total_timesteps)` 设定完整去噪时间步。
+2. 每一步都把 latent 复制成两份：
+   - 一份对应无条件分支
+   - 一份对应有条件分支
+3. UNet 预测噪声后，用 CFG 公式组合：
+   - `noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)`
+4. `scheduler.step(...)` 用新的噪声预测更新 latent。
+
+这就是从随机噪声逐步去噪到最终图像 latent 的过程。
+
+### 模块 8：图像解码与结果保存模块
+
+**模块作用**
+
+这是整个 pipeline 的最终输出模块。它把 `diffusion()` 产生的 latent 解码成 RGB 图像，并按目录结构保存为原始图、编辑图和拼接对比图。
+
+**对应代码**
+
+- `sample.py`
+  - `vae.decode(img.unsqueeze(0) / vae.config.scaling_factor, return_dict=False)[0]`
+  - `process_img(...)`
+  - `os.makedirs(os.path.join(save_path, mode), exist_ok=True)`
+  - `os.makedirs(os.path.join(save_path, 'combine'), exist_ok=True)`
+  - `decoded_imgs = {...}`
+  - `combine_images_horizontally(...)`
+  - `decoded_imgs[mode][idx].save(...)`
+  - `img_combined.save(...)`
+- `src.utils.process_img`
+  - 张量到 `[0, 255]` 像素范围
+  - `numpy` 转换
+  - `Image.fromarray(...)`
+
+**输入输出**
+
+- 输入
+  - original / edited image latent
+  - VAE
+  - 保存路径
+- 输出
+  - `original` 目录下的原始模型生成图
+  - `edit` 目录下的编辑模型生成图
+  - `combine` 目录下的横向拼接对比图
+
+**与其他模块的关系**
+
+它接收采样对比模块输出的 latent，产出最终可视化结果，供研究者判断：
+
+- target concept 是否被成功擦除或转向
+- retain concept 是否仍然保留
+- 编辑副作用是否过大
+
+**为什么要分成 `original / edit / combine`**
+
+1. `original`
+   - 保留基线结果，便于看编辑前模型会生成什么。
+2. `edit`
+   - 单独观察编辑后模型的输出。
+3. `combine`
+   - 把两张图横向放一起，方便人工快速比较是否发生了目标中的变化。
+
+## 3. 关键数据流总结
+
+### 数据流 1：prompt string → token ids → text embedding
+
+1. 文本先进入 `tokenizer(...)`。
+2. 得到固定长度的 token ids。
+3. token ids 进入 `text_encoder(...)`。
+4. 得到 token 级 embedding。
+5. 在编辑阶段，从中取 target / anchor / retain / null 的表示。
+6. 在采样阶段，从中取 unconditional / conditional prompt 的表示。
+
+### 数据流 2：target / anchor / retain embedding → 统计矩阵 → `delta_weight`
+
+1. target embedding 构造 `sum_target_target`。
+2. anchor 和 target 一起构造 `sum_anchor_target`。
+3. retain embedding 经过筛选和 DPA 扰动增强后，构造 `sum_ret_ret`。
+4. null prompt embedding 经聚类形成 `K2`。
+5. 这些矩阵一起进入 `delta_weight` 的求解公式。
+
+### 数据流 3：original UNet weight + `delta_weight` → edited UNet weight
+
+1. 每个可编辑层先取出 `layer_weight`。
+2. 根据 target / anchor / retain / IEC 约束计算 `delta_weight`。
+3. 用 `layer_weight + delta_weight` 得到 edited layer weight。
+4. 写回 `edit_dict[layer_name]`。
+
+### 数据流 4：edited UNet weight → `.pt` checkpoint → `sample.py`
+
+1. `edit_dict` 被 `torch.save(...)` 存成 `.pt` 文件。
+2. `sample.py` 复制原始 `unet` 得到 `unet_edit`。
+3. 再通过 `load_state_dict(...)` 把 `.pt` 中的编辑结果加载进去。
+
+### 数据流 5：random latent + text embedding → diffusion denoising → image latent
+
+1. 先采样随机噪声 latent。
+2. 将 unconditional 和 conditional embedding 拼接后送进 UNet。
+3. `diffusion()` 在多个 timestep 上反复预测噪声并更新 latent。
+4. 输出最终图像 latent。
+
+### 数据流 6：image latent → VAE decode → saved image
+
+1. latent 先除以 `vae.config.scaling_factor`。
+2. 再送入 `vae.decode(...)`。
+3. `process_img(...)` 把结果转成正常 PIL 图像。
+4. 最终保存到 `original / edit / combine` 目录。
+
+## 4. `train_erase_null.py` 和 `sample.py` 的衔接关系
+
+这两个文件不是孤立的，而是前后相接的一条实验链路。
+
+`train_erase_null.py` 负责回答的问题是：“怎样根据文本语义直接修改模型？”  
+它读取 target、anchor 和 retain 文本，通过文本编码、矩阵约束构造、DPA 增强和 closed-form 权重更新，最终输出一个 edited UNet checkpoint。
+
+`sample.py` 负责回答的问题是：“改完以后效果如何？”  
+它加载原始 Stable Diffusion 和 edited UNet，在相同 prompt、相同 latent、相同 scheduler 条件下采样，并保存对比结果。
+
+两者通过 `.pt` checkpoint 串起来：
+
+1. `train_erase_null.py` 产出 `.pt`
+2. `sample.py` 读取 `.pt`
+3. `sample.py` 用生成结果验证编辑是否成功
+
+所以如果把整个仓库看成一个 pipeline，那么：
+
+- 前者解决“怎么改模型”
+- 后者解决“改完后如何验证”
+
+## 5. 当前 PDF 的主要问题与修改建议
+
+由于当前任务目标是把旧文档从“函数说明”改写为“模块和 pipeline 说明”，因此旧版 PDF 如果主要按函数展开，通常会有以下问题。
+
+### 主要问题
+
+1. 过于函数级
+   - 容易变成逐行解释 `get_token_id()`、`edit_model()`、`diffusion()` 在做什么。
+   - 但学生不容易把这些局部解释拼成完整系统。
+2. 文件之间的关系不清楚
+   - 容易看完 `train_erase_null.py` 仍不知道它和 `sample.py` 怎么接起来。
+3. 模块输入输出不明确
+   - 比如 target / anchor / retain embedding 分别从哪里来、后面流向哪里，如果不单独梳理会很散。
+4. 关键变量流向不明确
+   - 如 `sum_target_target`、`sum_ret_ret`、`K2`、`delta_weight`、`edit_dict` 的角色如果只在局部解释，很难形成整体图景。
+5. 复杂矩阵计算先讲“怎么写”，后讲“为什么做”
+   - 这样会让读者先被公式和实现细节淹没，而不知道它们分别在服务什么目标。
+
+### 修改建议
+
+1. 先按模块理解代码，再补充函数细节。
+2. 每个模块都写清楚输入、处理、输出。
+3. 每个模块都要指回具体代码文件、函数和关键变量。
+4. 函数解释要服务于模块理解，而不是孤立罗列。
+5. 对关键变量必须说明“从哪里来，到哪里去”。
+6. 对矩阵和线性代数部分，先解释设计目的，再解释代码如何实现。
+
+## 6. 一段适合汇报的总结
+
+这份代码可以理解为一个模型编辑与验证 pipeline。第一阶段通过 `train_erase_null.py` 根据 `target`、`anchor` 和 `retain` 文本语义，直接修改 Stable Diffusion UNet 的部分 cross-attention 权重，并保存 edited checkpoint；第二阶段通过 `sample.py` 加载该 checkpoint，在相同 prompt 和相同 initial latent 下对比 original model 与 edited model 的生成结果，从而评估目标概念是否被有效擦除，同时非目标概念是否被保留。
