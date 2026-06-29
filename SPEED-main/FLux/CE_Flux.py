@@ -21,8 +21,8 @@ class MemitFluxConfig:
     trace_seed: int = 0
     trace_resolution: int = 512
     null_anchor_mode: str = "preserve_mean"
-    preserve_lambda: float = 1.0
     update_lambda: float = 1e-4
+    retain_threshold: float = 1e-1
     residual_scale: float = 1.0
 
 
@@ -35,36 +35,17 @@ def get_token_id(prompt, tokenizer=None, max_sequence_length=None, return_ids_on
     return token_ids.input_ids if return_ids_only else token_ids
 
 
-def _parse_concepts(raw_value):
-    return [] if not raw_value else [value.strip() for value in raw_value.split(";") if value.strip()]
-
-
-def _parse_replace_indices(edit_concepts, replace_indices_arg):
+def _parse_replace_indices(target_concepts, replace_indices_arg):
     if replace_indices_arg is None:
-        return [None] * len(edit_concepts)
+        return [None] * len(target_concepts)
     replace_indices = [
         None if value.strip() == "" or value.strip().lower() == "all"
         else [int(index.strip()) for index in value.split(",") if index.strip()]
         for value in replace_indices_arg.split(";")
     ]
-    if len(replace_indices) != len(edit_concepts):
-        raise ValueError("replace_indices length must match edit_concepts length")
+    if len(replace_indices) != len(target_concepts):
+        raise ValueError("replace_indices length must match target_concepts length")
     return replace_indices
-
-
-def _expand_concepts(edit_concepts, guide_concepts, concept_type, expand_prompts):
-    edits, guides = list(edit_concepts), list(guide_concepts)
-    if expand_prompts != "true":
-        return edits, guides
-    templates = (
-        ["painting by {}", "art by {}", "artwork by {}", "picture by {}", "style of {}"]
-        if concept_type == "art"
-        else ["image of {}", "photo of {}", "portrait of {}", "picture of {}", "painting of {}"]
-    )
-    for edit_concept, guide_concept in zip(edit_concepts, guide_concepts):
-        edits.extend(template.format(edit_concept) for template in templates)
-        guides.extend(template.format(guide_concept) for template in templates)
-    return edits, guides
 
 
 def _layer_indices(layer_start, layer_end, layer_stride):
@@ -86,14 +67,6 @@ def _select_text_qk_modules(transformer, device, layer_indices):
         if len(parts) >= 4 and parts[0] == "transformer_blocks" and int(parts[1]) in allowed_layers:
             selected.append((name, module.to(device)))
     return selected
-
-
-def _content_token_indices(pipeline, concept, requested_indices, max_sequence_length):
-    tokens = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
-    token_count = max(int(tokens.attention_mask.sum().item()) - 1, 0)
-    if requested_indices is None:
-        return list(range(token_count))
-    return [index for index in requested_indices if 0 <= index < token_count]
 
 
 def _trace_prompt(pipeline, prompt, token_indices, module_names, config, device, max_sequence_length):
@@ -141,11 +114,24 @@ def _trace_prompt(pipeline, prompt, token_indices, module_names, config, device,
     return compact
 
 
-def _closed_form_update(keys, residuals, preserve_gram, update_lambda, preserve_lambda):
+def _closed_form_update(keys, residuals, update_lambda, retain_inputs=None, retain_threshold=1e-1):
+    if retain_inputs is not None and retain_inputs.shape[1] > 0:
+        retain_inputs = retain_inputs.to(device=keys.device, dtype=keys.dtype)
+        covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
+        U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
+        null_basis = U[:, S < retain_threshold]
+        if null_basis.shape[1] == 0:
+            projector = torch.eye(keys.shape[0], device=keys.device, dtype=keys.dtype)
+        else:
+            projector = null_basis @ null_basis.T
+        projected_keys = projector @ keys
+        eye = torch.eye(projected_keys.shape[0], device=projected_keys.device, dtype=projected_keys.dtype)
+        system = projected_keys @ projected_keys.T + update_lambda * eye
+        delta = torch.linalg.solve(system.T, (residuals @ projected_keys.T).T).T
+        return delta @ projector
+
     eye = torch.eye(keys.shape[0], device=keys.device, dtype=keys.dtype)
     system = keys @ keys.T + update_lambda * eye
-    if preserve_gram is not None:
-        system = system + preserve_lambda * preserve_gram.to(device=keys.device, dtype=keys.dtype)
     return torch.linalg.solve(system.T, (residuals @ keys.T).T).T
 
 
@@ -185,14 +171,24 @@ def edit_model(
     anchor_concepts = anchor_concepts if anchor_concepts else retain_texts
     if not anchor_concepts:
         raise ValueError("anchor_concepts is empty and null-anchor requires retain_texts")
+    if len(anchor_concepts) == 1 and len(target_concepts) > 1:
+        anchor_concepts = anchor_concepts * len(target_concepts)
+    elif len(anchor_concepts) != len(target_concepts):
+        raise ValueError("anchor_concepts length must be 1 or match target_concepts length")
 
     # region [Target and Anchor]
-    token_indices = {
-        concept: _content_token_indices(pipeline, concept, None, max_sequence_length)
-        for concept in anchor_concepts + retain_texts
-    }
+    token_indices = {}
+    for concept in anchor_concepts + retain_texts:
+        concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
+        token_count = max(int(concept_inputs.attention_mask.sum().item()) - 1, 0)
+        token_indices[concept] = list(range(token_count))
     for concept, indices in zip(target_concepts, replace_indices):
-        token_indices[concept] = _content_token_indices(pipeline, concept, indices, max_sequence_length)
+        concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
+        token_count = max(int(concept_inputs.attention_mask.sum().item()) - 1, 0)
+        if indices is None:
+            token_indices[concept] = list(range(token_count))
+        else:
+            token_indices[concept] = [index for index in indices if 0 <= index < token_count]
 
     print("\nSelected text-side q/k modules:")
     for name in module_names:
@@ -207,14 +203,14 @@ def edit_model(
 
     # region [Retain]
     retain_traces = _trace_many(pipeline, retain_texts, token_indices, module_names, config, device, max_sequence_length)
-    preserve_grams = {}
+    retain_inputs_by_module = {}
     for module_name in module_names:
         retain_inputs = [
             retain_traces[concept][module_name]["inputs"]
             for concept in retain_texts
             if concept in retain_traces and module_name in retain_traces[concept]
         ]
-        preserve_grams[module_name] = None if not retain_inputs else (torch.cat(retain_inputs, dim=1) @ torch.cat(retain_inputs, dim=1).T)
+        retain_inputs_by_module[module_name] = None if not retain_inputs else torch.cat(retain_inputs, dim=1)
     # endregion
 
     edit_dict = {}
@@ -239,13 +235,17 @@ def edit_model(
             print(f"  Warning: no edit trace for {module_name}, skipping.")
             continue
 
-        preserve_gram = preserve_grams[module_name]
         keys = torch.cat(keys, dim=1).to(module.weight.device, torch.float32)
         residuals = torch.cat(residuals, dim=1).to(module.weight.device, torch.float32)
-        if preserve_gram is not None:
-            preserve_gram = preserve_gram.to(module.weight.device, torch.float32)
+        retain_inputs = retain_inputs_by_module[module_name]
 
-        delta = _closed_form_update(keys, residuals, preserve_gram, config.update_lambda, config.preserve_lambda)
+        delta = _closed_form_update(
+            keys,
+            residuals,
+            config.update_lambda,
+            None if retain_inputs is None else retain_inputs.to(module.weight.device, torch.float32),
+            config.retain_threshold,
+        )
         module.weight = torch.nn.Parameter(module.weight.float().add(delta).to(module.weight.dtype))
         edit_dict[module_name + ".weight"] = module.weight.detach().clone()
         print(f"  Updated {module_name} | ||delta||={delta.norm().item():.4f}")
@@ -257,9 +257,9 @@ def edit_model(
 
 def apply_memit_flux(
     model_id,
-    edit_concepts,
-    guide_concepts,
-    preserve_concepts,
+    target_concepts,
+    anchor_concepts,
+    retain_concepts,
     save_dir,
     exp_name,
     torch_dtype,
@@ -274,7 +274,7 @@ def apply_memit_flux(
         pipeline.vae.enable_slicing()
         pipeline.vae.enable_tiling()
     start_time = time.time()
-    edit_dict = edit_model(config, pipeline, edit_concepts, guide_concepts, preserve_concepts, replace_indices, device, max_sequence_length)
+    edit_dict = edit_model(config, pipeline, target_concepts, anchor_concepts, retain_concepts, replace_indices, device, max_sequence_length)
 
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, exp_name + ".safetensors")
@@ -292,19 +292,18 @@ UCE_double_proxy = apply_memit_flux
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="MEMITFlux", description="MEMIT-style concept erasure for FLUX text-side q/k")
-    parser.add_argument("--edit_concepts", type=str, default=None)
     parser.add_argument("--target_concepts", type=str, default=None)
-    parser.add_argument("--guide_concepts", type=str, default=None)
     parser.add_argument("--anchor_concepts", type=str, default=None)
-    parser.add_argument("--preserve_concepts", type=str, default=None)
     parser.add_argument("--retain_concepts", type=str, default=None)
+    parser.add_argument("--edit_concepts", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--guide_concepts", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--preserve_concepts", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--concept_type", type=str, required=True, choices=["art", "object"])
     parser.add_argument("--replace_indices", type=str, default="all")
     parser.add_argument("--model_id", type=str, default="black-forest-labs/FLUX.1-schnell")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--save_dir", type=str, default="./models")
     parser.add_argument("--exp_name", type=str, default=None)
-    parser.add_argument("--expand_prompts", type=str, default="false", choices=["true", "false"])
     parser.add_argument("--layer_start", type=int, default=6)
     parser.add_argument("--layer_end", type=int, default=15)
     parser.add_argument("--layer_stride", type=int, default=2)
@@ -312,23 +311,26 @@ if __name__ == "__main__":
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--null_anchor_mode", type=str, default="preserve_mean", choices=["preserve_mean"])
-    parser.add_argument("--preserve_lambda", type=float, default=1.0)
     parser.add_argument("--update_lambda", type=float, default=1e-4)
+    parser.add_argument("--retain_threshold", type=float, default=1e-1)
     parser.add_argument("--residual_scale", type=float, default=1.0)
     args = parser.parse_args()
 
-    target_arg = args.edit_concepts or args.target_concepts
+    target_arg = args.target_concepts or args.edit_concepts
     if not target_arg:
-        parser.error("--edit_concepts or --target_concepts is required")
-    anchor_arg = args.guide_concepts if args.guide_concepts is not None else args.anchor_concepts
-    retain_arg = args.preserve_concepts if args.preserve_concepts is not None else args.retain_concepts
+        parser.error("--target_concepts is required")
+    anchor_arg = args.anchor_concepts if args.anchor_concepts is not None else args.guide_concepts
+    retain_arg = args.retain_concepts if args.retain_concepts is not None else args.preserve_concepts
 
-    edit_concepts = _parse_concepts(target_arg)
-    guide_concepts = _parse_concepts(anchor_arg or ("art" if args.concept_type == "art" else ""))
-    preserve_concepts = _parse_concepts(retain_arg)
-    replace_indices = _parse_replace_indices(edit_concepts, args.replace_indices)
-    edit_concepts, guide_concepts = _expand_concepts(edit_concepts, guide_concepts, args.concept_type, args.expand_prompts)
-    replace_indices += [None] * max(len(edit_concepts) - len(replace_indices), 0)
+    target_concepts = [value.strip() for value in target_arg.split(";") if value.strip()]
+    anchor_concepts = [
+        value.strip()
+        for value in (anchor_arg or ("art" if args.concept_type == "art" else "")).split(";")
+        if value.strip()
+    ]
+    retain_concepts = [] if not retain_arg else [value.strip() for value in retain_arg.split(";") if value.strip()]
+    replace_indices = _parse_replace_indices(target_concepts, args.replace_indices)
+    replace_indices += [None] * max(len(target_concepts) - len(replace_indices), 0)
     config = MemitFluxConfig(
         args.layer_start,
         args.layer_end,
@@ -337,19 +339,19 @@ if __name__ == "__main__":
         args.trace_seed,
         args.trace_resolution,
         args.null_anchor_mode,
-        args.preserve_lambda,
         args.update_lambda,
+        args.retain_threshold,
         args.residual_scale,
     )
 
-    print(f"\nErasing  : {edit_concepts}")
-    print(f"Guiding  : {guide_concepts}")
-    print(f"Preserving: {preserve_concepts}\n")
+    print(f"\nTarget: {target_concepts}")
+    print(f"Anchor: {anchor_concepts}")
+    print(f"Retain: {retain_concepts}\n")
     apply_memit_flux(
         model_id=args.model_id,
-        edit_concepts=edit_concepts,
-        guide_concepts=guide_concepts,
-        preserve_concepts=preserve_concepts,
+        target_concepts=target_concepts,
+        anchor_concepts=anchor_concepts,
+        retain_concepts=retain_concepts,
         save_dir=args.save_dir,
         exp_name=args.exp_name or "flux_memit_qk_test",
         torch_dtype=torch.bfloat16,
