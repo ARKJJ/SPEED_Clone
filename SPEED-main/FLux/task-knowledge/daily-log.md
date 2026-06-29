@@ -25,3 +25,42 @@
 - 是否已经成功生成 `models/*.safetensors`。
 - q/k 层差偏移是否能稳定削弱目标概念。
 
+## 2026-06-29
+
+日期：
+2026-06-29
+
+今日目标：
+将 FLUX 概念擦除代码整理为接近 `train_erase_null.py` 的单文件训练/编辑脚本结构，同时保留 MEMIT-style 机制。当前目标不是追求最优擦除效果，而是把 MEMIT 的多层真实激活写入机制完整迁移到 FLUX dual block 文本侧 q/k 权重编辑中。
+
+今日完成：
+- 明确权重编辑位置限定为 FLUX dual block 的文本侧 q/k：`transformer_blocks.{i}.attn.add_q_proj.weight` 和 `transformer_blocks.{i}.attn.add_k_proj.weight`。
+- 排除图像侧 q/k/v、文本侧 v、single transformer blocks、context embedder 和其他非目标模块，避免污染变量和编辑范围。
+- 将代码结构整理，包括 token 定位、目标模块筛选、forward trace、闭式更新、`edit_model(...)` 主入口、CLI 参数解析和 safetensors 保存。
+- 保留 MEMIT-style 的核心机制：通过真实 FLUX forward hook 获取每个目标层的实际输入/输出状态，而不是用静态文本 embedding 代替中间状态。
+- 将概念参数整理为 `target_concepts`、`anchor_concepts`、`retain_concepts`，并保留旧参数别名用于兼容。
+- 在更新公式中保留原权重与闭式求得的增量结合，即 `W_new = W_old + delta`。
+
+修改文件：
+- `SPEED-main/FLux/CE_Flux.py`
+- `SPEED-main/FLux/sample.py`
+
+
+验证结果：
+- 目前尚未完成真实 FLUX pipeline/GPU 运行验证；现阶段验证只覆盖文件结构、静态代码逻辑和日志写入。
+
+当前问题：
+- 默认编辑层范围仍未经过实验验证，不能假设中层间隔选择就是最优。
+- q/k 编辑是否足以稳定完成 concept eraser 任务，需要通过生成结果和保留概念评估确认。
+- `retain_threshold`、`update_lambda`、`residual_scale` 等超参数仍需要实验调参。
+- anchor 为空时使用 null/retain 的策略需要进一步统一，否则不同实验之间不可比。
+
+下一步计划：
+- 先运行最小 smoke test：单个 target、单个 anchor、单层 q/k、低分辨率 trace。
+- 检查生成的 `.safetensors` 是否只包含预期的文本侧 q/k 权重 key。
+- 用 `sample.py` 加载编辑权重，比较 original 和 erased 输出。
+- 在最小流程确认可运行后，再扩展到多层、多概念和 retain 消融实验。
+
+需要人工确认的地方：
+- anchor 为空时，是使用 null-anchor、retain 均值，还是必须显式指定 anchor concept。
+- 后续效果验证采用人工看图、CLIP 相似度，还是加入分类器/检测器指标。
