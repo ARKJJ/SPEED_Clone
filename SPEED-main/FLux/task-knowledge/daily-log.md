@@ -63,4 +63,17 @@
 
 需要人工确认的地方：
 - anchor 为空时，是使用 null-anchor、retain 均值，还是必须显式指定 anchor concept。
-- 后续效果验证采用人工看图、CLIP 相似度，还是加入分类器/检测器指标。
+- 后续效果验证采用人工看图、CLIP 相似度。
+python FLux/sample.py \
+  --mode original,edit \
+  --erase_type instance \
+  --target_concept "Snoopy" \
+  --contents "Snoopy" \
+  --model_id black-forest-labs/FLUX.1-schnell \
+  --edit_ckpt FLux/models/erase_snoopy_object_qk_strong.safetensors \
+  --save_root FLux/results/erase_snoopy_object_qk_strong \
+  --device cuda:0 \
+  --num_samples 1 \
+  --batch_size 1 \
+  --total_timesteps 4 \
+  --guidance_scale 0.0

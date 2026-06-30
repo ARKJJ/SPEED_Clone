@@ -10,27 +10,8 @@ from PIL import Image
 import torch
 from diffusers import DiffusionPipeline
 from safetensors.torch import load_file
-
-try:
-    from src.template import template_dict
-except ModuleNotFoundError:
-    speed_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "SPEED-main"))
-    if speed_src not in sys.path:
-        sys.path.append(speed_src)
-    from src.template import template_dict
-
-try:
-    from src.utils import seed_everything
-except ModuleNotFoundError:
-    def seed_everything(seed, deterministic=False):
-        import random
-
-        random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        if deterministic:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
+from src.template import template_dict
+from src.utils import seed_everything
 
 
 def expected_output_count(prompt_templates, num_samples):
