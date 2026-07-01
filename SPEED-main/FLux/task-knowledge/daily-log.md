@@ -1,6 +1,6 @@
 # Daily Log
 
-## 2026-06-28
+## 2026-06-29
 
 ### 完成
 
@@ -25,7 +25,7 @@
 - 是否已经成功生成 `models/*.safetensors`。
 - q/k 层差偏移是否能稳定削弱目标概念。
 
-## 2026-06-29
+## 2026-06-30
 
 日期：
 2026-06-29
@@ -64,16 +64,63 @@
 需要人工确认的地方：
 - anchor 为空时，是使用 null-anchor、retain 均值，还是必须显式指定 anchor concept。
 - 后续效果验证采用人工看图、CLIP 相似度。
-python FLux/sample.py \
+
+  CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
+  --target_concepts "Van Gogh" \
+  --anchor_concepts "painting" \
+  --retain_path "FLux/data/style_100.csv" \
+  --heads "concept" \
+  --save_path "FLux/models" \
+  --file_name "erase_vangogh_to_painting" \
+  --params KV \
+  --residual_scale 10.0 \
+  --update_lambda 1e-3 \
+  --threshold 1e-1
+
+  CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
+  --mode original,edit \
+  --erase_type style \
+  --target_concept "Van Gogh" \
+  --contents "Van Gogh" \
+  --edit_ckpt "FLux/models/erase_vangogh_to_painting.safetensors" \
+  --save_root "FLux/results_vangogh_to_painting" \
+  --prompts "{} style painting of a village; a landscape painting in the style of {}; a portrait in {} style; wheat field under a swirling sky in the style of {}" \
+  --num_samples 20 \
+  --batch_size 5 \
+  --strict_edit_load
+
+  CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
+  --target_concepts "Snoopy" \
+  --anchor_concepts "dog" \
+  --retain_path "FLux/data/instance_small.csv" \
+  --heads "concept" \
+  --save_path "FLux/models" \
+  --file_name "erase_snoopy_to_dog_s5" \
+  --params KV \
+  --residual_scale 10.0 \
+  --update_lambda 1e-3 \
+  --threshold 1e-1
+
+  CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
   --mode original,edit \
   --erase_type instance \
   --target_concept "Snoopy" \
   --contents "Snoopy" \
-  --model_id black-forest-labs/FLUX.1-schnell \
-  --edit_ckpt FLux/models/erase_snoopy_object_qk_strong.safetensors \
-  --save_root FLux/results/erase_snoopy_object_qk_strong \
-  --device cuda:0 \
-  --num_samples 1 \
-  --batch_size 1 \
-  --total_timesteps 4 \
-  --guidance_scale 0.0
+  --edit_ckpt "FLux/models/erase_snoopy_to_dog_s5.safetensors" \
+  --save_root "FLux/results_snoopy_to_dog_kv_s6_t01_fresh" \
+  --prompts "a photo of {}; a cartoon image of {}; {} character" \
+  --num_samples 20 \
+  --batch_size 5 \
+  --strict_edit_load
+
+  CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
+  --mode original,edit \
+  --erase_type instance \
+  --target_concept "Snoopy" \
+  --contents "Hello Kitty" \
+  --edit_ckpt "FLux/models/erase_snoopy_to_dog_s5.safetensors" \
+  --save_root "FLux/results_retain_hellokitty_after_snoopy_s5_fresh" \
+  --prompts "a photo of {}; a cartoon image of {}; {} character; {} in a park; {} with a colorful background" \
+  --num_samples 20 \
+  --batch_size 5 \
+  --strict_edit_load

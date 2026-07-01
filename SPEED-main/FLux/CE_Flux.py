@@ -1,37 +1,16 @@
-import os, re, random
+import os, re
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import time
 import torch
 import argparse
 import pandas as pd
-
-torch.set_grad_enabled(False)
-
 from diffusers import DiffusionPipeline
 from safetensors.torch import save_file
-
-
-def seed_everything(seed, deterministic=False):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
 
 def get_token_id(prompt, tokenizer=None, max_sequence_length=None, return_ids_only=True):
     token_ids = tokenizer(prompt,padding="max_length",max_length=max_sequence_length or tokenizer.model_max_length,truncation=True,return_tensors="pt")
     return token_ids.input_ids if return_ids_only else token_ids
-
-
-def _layer_indices(layer_start, layer_end, layer_stride):#筛选层
-    if layer_stride <= 0:
-        raise ValueError("layer_stride must be positive")
-    if layer_end <= layer_start:
-        raise ValueError("layer_end must be greater than layer_start")
-    return list(range(layer_start, layer_end, layer_stride))
 
 
 def _attention_suffixes(params):
@@ -41,13 +20,29 @@ def _attention_suffixes(params):
         "V": ".attn.add_v_proj",
     }
     params = params.upper()
-    if params not in {"Q", "K", "V", "QK", "KV", "QKV"}:
-        raise ValueError("--params must be one of Q, K, V, QK, KV, QKV")
     return [param_map[param] for param in "QKV" if param in params]
 
 
-def _select_text_attention_modules(transformer, device, layer_indices, params):#选择层里面的text-side attention模块
-    selected, allowed_layers = [], set(layer_indices)
+def _attention_suffix(module_name):
+    for suffix in _attention_suffixes("QKV"):
+        if suffix in module_name:
+            return suffix
+    raise ValueError(f"Unsupported attention module name: {module_name}")
+
+
+def _final_modules_by_suffix(module_names):
+    final_modules = {}
+    for module_name in module_names:
+        final_modules[_attention_suffix(module_name)] = module_name
+    return final_modules
+
+
+def _remaining_modules_with_suffix(module_names, module_index, suffix):
+    return sum(1 for name in module_names[module_index:] if _attention_suffix(name) == suffix)
+
+
+def _select_text_attention_modules(transformer, device, params):#选择所有transformer block里的text-side attention模块
+    selected = []
     suffixes = _attention_suffixes(params)
     for name, module in transformer.named_modules():
         if not hasattr(module, "weight") or module.weight is None:
@@ -55,7 +50,7 @@ def _select_text_attention_modules(transformer, device, layer_indices, params):#
         if not any(suffix in name for suffix in suffixes):
             continue
         parts = name.split(".")
-        if len(parts) >= 4 and parts[0] == "transformer_blocks" and int(parts[1]) in allowed_layers:
+        if len(parts) >= 4 and parts[0] == "transformer_blocks":
             selected.append((name, module.to(device)))
     return selected
 
@@ -77,7 +72,7 @@ def _trace_prompt(pipeline, prompt, token_indices, module_names, args, device, m
 
         handles.extend([module.register_forward_pre_hook(pre_hook), module.register_forward_hook(out_hook)])
 
-    try:
+    try:#此处待删除
         generator = torch.Generator(device=device).manual_seed(args.trace_seed)
         with torch.no_grad():
             pipeline(
@@ -116,7 +111,7 @@ def _closed_form_update(keys, residuals, update_lambda, retain_inputs, retain_th
         projector = null_basis @ null_basis.T
     projected_keys = projector @ keys
     eye = torch.eye(projected_keys.shape[0], device=projected_keys.device, dtype=projected_keys.dtype)
-    system = projected_keys @ projected_keys.T + update_lambda * eye
+    system = projected_keys @ projected_keys.T + update_lambda * eye#？
     delta = torch.linalg.solve(system.T, (residuals @ projected_keys.T).T).T
     return delta @ projector
 
@@ -135,14 +130,9 @@ def _mean_outputs(traces, concepts, module_name):
 
 
 def edit_model(args,pipeline,target_concepts,anchor_concepts,retain_texts,device="cuda:0",max_sequence_length=256,):
-    layer_ids = _layer_indices(args.layer_start, args.layer_end, args.layer_stride)
-    edit_modules = _select_text_attention_modules(pipeline.transformer, device, layer_ids, args.params)
-    if not edit_modules:
-        raise RuntimeError("No text-side attention modules were selected for editing")
-
+    edit_modules = _select_text_attention_modules(pipeline.transformer, device, args.params)
     module_names = [name for name, _ in edit_modules]
-    if len(anchor_concepts) != len(target_concepts):
-        raise ValueError("anchor_concepts length must match target_concepts length")
+
     retain_texts = [
         text for text in retain_texts
         if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", text.lower()) for concept in target_concepts)
@@ -164,6 +154,14 @@ def edit_model(args,pipeline,target_concepts,anchor_concepts,retain_texts,device
     print("\nSelected text-side attention modules:")
     for name in module_names:
         print(f"  {name}")
+
+    final_modules = _final_modules_by_suffix(module_names)
+    final_module_names = list(dict.fromkeys(final_modules.values()))
+    anchor_final_traces = _trace_many(pipeline, anchor_concepts, token_indices, final_module_names, args, device, max_sequence_length)
+    anchor_final_means = {
+        module_name: _mean_outputs(anchor_final_traces, anchor_concepts, module_name)
+        for module_name in final_module_names
+    }
     # endregion
 
     # region [Retain]
@@ -184,21 +182,24 @@ def edit_model(args,pipeline,target_concepts,anchor_concepts,retain_texts,device
 
     # region [Layer Update]
     for module_index, (module_name, module) in enumerate(edit_modules):
-        anchor_traces = _trace_many(pipeline, anchor_concepts, token_indices, module_names, args, device, max_sequence_length)
-        target_mean = _mean_outputs(anchor_traces, anchor_concepts, module_name)
-        if target_mean is None:
-            print(f"  Warning: no anchor trace for {module_name}, skipping.")
+        suffix = _attention_suffix(module_name)
+        final_module_name = final_modules[suffix]
+        anchor_final_mean = anchor_final_means[final_module_name]
+        if anchor_final_mean is None:
+            print(f"  Warning: no final anchor trace for {final_module_name}, skipping {module_name}.")
             continue
 
-        edit_traces = _trace_many(pipeline, target_concepts, token_indices, module_names, args, device, max_sequence_length)
+        trace_module_names = list(dict.fromkeys([module_name, final_module_name]))
+        edit_traces = _trace_many(pipeline, target_concepts, token_indices, trace_module_names, args, device, max_sequence_length)
+        remaining_count = max(_remaining_modules_with_suffix(module_names, module_index, suffix), 1)
         keys, residuals = [], []
         for concept in target_concepts:
-            if concept not in edit_traces or module_name not in edit_traces[concept]:
+            if concept not in edit_traces or module_name not in edit_traces[concept] or final_module_name not in edit_traces[concept]:
                 continue
-            current = edit_traces[concept][module_name]["outputs"]
-            target = target_mean.to(current.device, current.dtype).expand(-1, current.shape[1])
+            final_current = edit_traces[concept][final_module_name]["outputs"]
+            target = anchor_final_mean.to(final_current.device, final_current.dtype).expand(-1, final_current.shape[1])
             keys.append(edit_traces[concept][module_name]["inputs"])
-            residuals.append((target - current) * (args.residual_scale / max(len(edit_modules) - module_index, 1)))
+            residuals.append((target - final_current) * (args.residual_scale / remaining_count))
         if not keys:
             print(f"  Warning: no edit trace for {module_name}, skipping.")
             continue
@@ -236,16 +237,12 @@ if __name__ == "__main__":
     parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
     parser.add_argument("--threshold", type=float, default=1e-1)
     # FLUX/MEMIT-specific controls
-    parser.add_argument("--layer_start", type=int, default=6)
-    parser.add_argument("--layer_end", type=int, default=15)
-    parser.add_argument("--layer_stride", type=int, default=2)
     parser.add_argument("--trace_num_steps", type=int, default=4)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=1e-4)
     parser.add_argument("--residual_scale", type=float, default=1.0)
     args = parser.parse_args()
-    seed_everything(args.seed)
 
     target_concepts = [con.strip() for con in args.target_concepts.split(",")]
     if not target_concepts or any(concept == "" for concept in target_concepts):
