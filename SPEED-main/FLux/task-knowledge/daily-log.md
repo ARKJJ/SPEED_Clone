@@ -100,9 +100,9 @@
   --retain_path "FLux/data/instance_small.csv" \
   --heads "concept" \
   --save_path "FLux/models" \
-  --file_name "erase_snoopy_to_dog_QKV_r8" \
+  --file_name "erase_snoopy_to_dog_QKV_r9" \
   --params QKV \
-  --residual_scale 8.0 \
+  --residual_scale 9.0 \
   --update_lambda 1e-3 \
   --threshold 1e-1
 
@@ -111,8 +111,8 @@
   --erase_type instance \
   --target_concept "Snoopy" \
   --contents "Snoopy" \
-  --edit_ckpt "FLux/models/erase_snoopy_to_dog_QKV_r8.safetensors" \
-  --save_root "FLux/results_snoopy_to_null_QKV_r8" \
+  --edit_ckpt "FLux/models/erase_snoopy_to_dog_QKV_r9.safetensors" \
+  --save_root "FLux/results_snoopy_to_null_QKV_r9" \
   --prompts "a photo of {}; {} in a park; {} character" \
   --num_samples 20 \
   --batch_size 5 \
