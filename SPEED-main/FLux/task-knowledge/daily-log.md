@@ -65,14 +65,16 @@
 - anchor 为空时，是使用 null-anchor、retain 均值，还是必须显式指定 anchor concept。
 - 后续效果验证采用人工看图、CLIP 相似度。
 
+！实验方法问题：FLUX 概念编辑中，token pooling 方式可能影响效果：mean pooling 更稳健，last-token pooling 更接近 SPEED，后续需对名人/风格删除做消融实验。
+
   CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
   --target_concepts "Van Gogh" \
   --anchor_concepts "painting" \
   --retain_path "FLux/data/style_100.csv" \
   --heads "concept" \
   --save_path "FLux/models" \
-  --file_name "erase_vangogh_to_painting" \
-  --params KV \
+  --file_name "erase_vangogh_to_painting_QK_r10" \
+  --params QK \
   --residual_scale 10.0 \
   --update_lambda 1e-3 \
   --threshold 1e-1
@@ -82,22 +84,25 @@
   --erase_type style \
   --target_concept "Van Gogh" \
   --contents "Van Gogh" \
-  --edit_ckpt "FLux/models/erase_vangogh_to_painting.safetensors" \
-  --save_root "FLux/results_vangogh_to_painting" \
-  --prompts "{} style painting of a village; a landscape painting in the style of {}; a portrait in {} style; wheat field under a swirling sky in the style of {}" \
+  --edit_ckpt "FLux/models/erase_vangogh_to_painting_QK_r10.safetensors" \
+  --save_root "FLux/results_vangogh_to_painting_QK_r10" \
+  --prompts "a painting by {}; a landscape by {};  a village scene by {}; a flower vase by {}" \
   --num_samples 20 \
   --batch_size 5 \
   --strict_edit_load
 
+
+
+
   CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
   --target_concepts "Snoopy" \
-  --anchor_concepts "dog" \
+  --anchor_concepts "" \
   --retain_path "FLux/data/instance_small.csv" \
   --heads "concept" \
   --save_path "FLux/models" \
-  --file_name "erase_snoopy_to_dog_s5" \
-  --params KV \
-  --residual_scale 10.0 \
+  --file_name "erase_snoopy_to_dog_QKV_r8" \
+  --params QKV \
+  --residual_scale 8.0 \
   --update_lambda 1e-3 \
   --threshold 1e-1
 
@@ -106,9 +111,9 @@
   --erase_type instance \
   --target_concept "Snoopy" \
   --contents "Snoopy" \
-  --edit_ckpt "FLux/models/erase_snoopy_to_dog_s5.safetensors" \
-  --save_root "FLux/results_snoopy_to_dog_kv_s6_t01_fresh" \
-  --prompts "a photo of {}; a cartoon image of {}; {} character" \
+  --edit_ckpt "FLux/models/erase_snoopy_to_dog_QKV_r8.safetensors" \
+  --save_root "FLux/results_snoopy_to_null_QKV_r8" \
+  --prompts "a photo of {}; {} in a park; {} character" \
   --num_samples 20 \
   --batch_size 5 \
   --strict_edit_load

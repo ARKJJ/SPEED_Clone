@@ -8,49 +8,32 @@ from diffusers import DiffusionPipeline
 from safetensors.torch import save_file
 
 
+ATTENTION_SUFFIXES = {
+    "Q": ".attn.add_q_proj",
+    "K": ".attn.add_k_proj",
+    "V": ".attn.add_v_proj",
+}
+
+
 def get_token_id(prompt, tokenizer=None, max_sequence_length=None, return_ids_only=True):
     token_ids = tokenizer(prompt,padding="max_length",max_length=max_sequence_length or tokenizer.model_max_length,truncation=True,return_tensors="pt")
     return token_ids.input_ids if return_ids_only else token_ids
 
 
-def _attention_suffixes(params):
-    param_map = {
-        "Q": ".attn.add_q_proj",
-        "K": ".attn.add_k_proj",
-        "V": ".attn.add_v_proj",
-    }
+def _selected_attention_suffixes(params):
     params = params.upper()
-    return [param_map[param] for param in "QKV" if param in params]
-
-
-def _attention_suffix(module_name):
-    for suffix in _attention_suffixes("QKV"):
-        if suffix in module_name:
-            return suffix
-    raise ValueError(f"Unsupported attention module name: {module_name}")
-
-
-def _final_modules_by_suffix(module_names):
-    final_modules = {}
-    for module_name in module_names:
-        final_modules[_attention_suffix(module_name)] = module_name
-    return final_modules
-
-
-def _remaining_modules_with_suffix(module_names, module_index, suffix):
-    return sum(1 for name in module_names[module_index:] if _attention_suffix(name) == suffix)
+    return [ATTENTION_SUFFIXES[param] for param in "QKV" if param in params]
 
 
 def _select_text_attention_modules(transformer, device, params):#选择所有transformer block里的text-side attention模块
     selected = []
-    suffixes = _attention_suffixes(params)
+    suffixes = _selected_attention_suffixes(params)
     for name, module in transformer.named_modules():
         if not hasattr(module, "weight") or module.weight is None:
             continue
         if not any(suffix in name for suffix in suffixes):
             continue
-        parts = name.split(".")
-        if len(parts) >= 4 and parts[0] == "transformer_blocks":
+        if name.startswith("transformer_blocks."):
             selected.append((name, module.to(device)))
     return selected
 
@@ -72,7 +55,7 @@ def _trace_prompt(pipeline, prompt, token_indices, module_names, args, device, m
 
         handles.extend([module.register_forward_pre_hook(pre_hook), module.register_forward_hook(out_hook)])
 
-    try:#此处待删除
+    try:
         generator = torch.Generator(device=device).manual_seed(args.trace_seed)
         with torch.no_grad():
             pipeline(
@@ -111,7 +94,7 @@ def _closed_form_update(keys, residuals, update_lambda, retain_inputs, retain_th
         projector = null_basis @ null_basis.T
     projected_keys = projector @ keys
     eye = torch.eye(projected_keys.shape[0], device=projected_keys.device, dtype=projected_keys.dtype)
-    system = projected_keys @ projected_keys.T + update_lambda * eye#？
+    system = projected_keys @ projected_keys.T + update_lambda * eye
     delta = torch.linalg.solve(system.T, (residuals @ projected_keys.T).T).T
     return delta @ projector
 
@@ -130,8 +113,24 @@ def _mean_outputs(traces, concepts, module_name):
 
 
 def edit_model(args,pipeline,target_concepts,anchor_concepts,retain_texts,device="cuda:0",max_sequence_length=256,):
+    if len(target_concepts) != len(anchor_concepts):
+        raise ValueError("target_concepts and anchor_concepts must have the same length")
+
     edit_modules = _select_text_attention_modules(pipeline.transformer, device, args.params)
     module_names = [name for name, _ in edit_modules]
+    selected_suffixes = _selected_attention_suffixes(args.params)
+    module_suffixes = {
+        name: next(suffix for suffix in selected_suffixes if suffix in name)
+        for name in module_names
+    }
+    final_modules = {}
+    remaining_counts = [0] * len(module_names)
+    suffix_counts = {}
+    for module_index in range(len(module_names) - 1, -1, -1):
+        suffix = module_suffixes[module_names[module_index]]
+        suffix_counts[suffix] = suffix_counts.get(suffix, 0) + 1
+        remaining_counts[module_index] = suffix_counts[suffix]
+        final_modules.setdefault(suffix, module_names[module_index])
 
     retain_texts = [
         text for text in retain_texts
@@ -155,8 +154,7 @@ def edit_model(args,pipeline,target_concepts,anchor_concepts,retain_texts,device
     for name in module_names:
         print(f"  {name}")
 
-    final_modules = _final_modules_by_suffix(module_names)
-    final_module_names = list(dict.fromkeys(final_modules.values()))
+    final_module_names = [final_modules[suffix] for suffix in selected_suffixes if suffix in final_modules]
     anchor_final_traces = _trace_many(pipeline, anchor_concepts, token_indices, final_module_names, args, device, max_sequence_length)
     anchor_final_means = {
         module_name: _mean_outputs(anchor_final_traces, anchor_concepts, module_name)
@@ -182,27 +180,20 @@ def edit_model(args,pipeline,target_concepts,anchor_concepts,retain_texts,device
 
     # region [Layer Update]
     for module_index, (module_name, module) in enumerate(edit_modules):
-        suffix = _attention_suffix(module_name)
+        suffix = module_suffixes[module_name]
         final_module_name = final_modules[suffix]
         anchor_final_mean = anchor_final_means[final_module_name]
-        if anchor_final_mean is None:
-            print(f"  Warning: no final anchor trace for {final_module_name}, skipping {module_name}.")
-            continue
 
         trace_module_names = list(dict.fromkeys([module_name, final_module_name]))
         edit_traces = _trace_many(pipeline, target_concepts, token_indices, trace_module_names, args, device, max_sequence_length)
-        remaining_count = max(_remaining_modules_with_suffix(module_names, module_index, suffix), 1)
+        remaining_count = remaining_counts[module_index]
         keys, residuals = [], []
         for concept in target_concepts:
-            if concept not in edit_traces or module_name not in edit_traces[concept] or final_module_name not in edit_traces[concept]:
-                continue
-            final_current = edit_traces[concept][final_module_name]["outputs"]
+            concept_trace = edit_traces[concept]
+            final_current = concept_trace[final_module_name]["outputs"]
             target = anchor_final_mean.to(final_current.device, final_current.dtype).expand(-1, final_current.shape[1])
-            keys.append(edit_traces[concept][module_name]["inputs"])
+            keys.append(concept_trace[module_name]["inputs"])
             residuals.append((target - final_current) * (args.residual_scale / remaining_count))
-        if not keys:
-            print(f"  Warning: no edit trace for {module_name}, skipping.")
-            continue
 
         keys = torch.cat(keys, dim=1).to(module.weight.device, torch.float32)
         residuals = torch.cat(residuals, dim=1).to(module.weight.device, torch.float32)
