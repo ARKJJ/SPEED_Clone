@@ -65,7 +65,6 @@
 - anchor 为空时，是使用 null-anchor、retain 均值，还是必须显式指定 anchor concept。
 - 后续效果验证采用人工看图、CLIP 相似度。
 
-！实验方法问题：FLUX 概念编辑中，token pooling 方式可能影响效果：mean pooling 更稳健，last-token pooling 更接近 SPEED，后续需对名人/风格删除做消融实验。
 
   CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
   --target_concepts "Van Gogh" \

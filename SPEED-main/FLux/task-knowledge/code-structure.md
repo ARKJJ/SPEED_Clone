@@ -55,21 +55,7 @@ FLux/
 | `_trace_prompt` | 注册 forward hook，记录模块输入和输出 | MEMIT 式层差偏移依赖这些中间激活 |
 | `_closed_form_update` | 根据 keys、residuals 和 update 正则求解 delta | 是当前编辑机制的数学核心 |
 | `edit_model` | 组织 trace、约束构造和逐层更新 | 是从概念输入到权重更新的主流程 |
-| `apply_memit_flux` | 加载模型、调用编辑、保存结果 | 是命令行入口背后的封装函数 |
-| `UCE_double_proxy` | `apply_memit_flux` 的别名 | 可能用于兼容旧接口，当前用途待确认 |
 
-## `sample.py`
-
-`sample.py` 当前仍是 Stable Diffusion 风格采样脚本：它加载 `DiffusionPipeline` 后使用 `unet`、`tokenizer`、`text_encoder`、`vae`，并通过 `unet_edit.load_state_dict(torch.load(...))` 加载 `.pt` 权重。
-
-这点很重要，因为它和 `CE_Flux.py` 输出不匹配：
-
-- `CE_Flux.py` 输出 `.safetensors`。
-- `sample.py` 期望 `.pt`。
-- `CE_Flux.py` 编辑 FLUX transformer q/k。
-- `sample.py` 加载并替换 UNet 权重。
-
-因此，目前不能把 `sample.py` 当作 FLUX 版验证脚本。它要么是历史拷贝，要么需要后续改造。
 
 ## `data/`
 
@@ -88,17 +74,7 @@ FLux/
 
 这些数据重要，是因为 FLUX 实验最终也需要可重复的 target、retain 和 evaluation prompts。但当前 `CE_Flux.py` 尚未直接读取 CSV，所以数据只是可用资源，不是已经接入的 pipeline。
 
-## `scripts/`
 
-`scripts/` 下包含：
-
-- `eval_few.sh`
-- `eval_multi.sh`
-- `eval_nudity.sh`
-
-这些脚本目前仍引用 `train_erase_null.py`、`sample2.py`、`src/clip_score_cal.py` 等 FLux 目录中未看到的文件。因此它们更像从 SPEED 主项目复制来的实验脚本，而不是已经完成的 FLUX 实验脚本。
-
-对新人来说，这个判断非常重要：不要直接运行这些脚本并假设它们会评估 `CE_Flux.py`。在运行前必须先确认它们是否已迁移到 FLUX 权重保存和加载方式。
 
 ## `task-knowledge/`
 
@@ -112,8 +88,4 @@ FLux/
 
 这个目录不参与模型运行，但对研究协作很重要。它能减少“代码能跑但没人知道为什么这样改”的问题，也能把待确认的研究假设显式记录下来。
 
-## 待确认
 
-- `sample.py` 是否应删除、保留为旧参考，或改造成 FLUX 采样脚本。
-- `scripts/` 是否应整体重写为 FLUX 版评估脚本。
-- 是否需要新增 `src/` 目录来放 FLUX 采样、token 检查和评估工具。

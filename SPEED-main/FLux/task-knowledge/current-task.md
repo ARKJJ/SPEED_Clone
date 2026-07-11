@@ -40,11 +40,7 @@
 
 ## 验证方式
 
-代码级验证：
 
-```bash
-env PYTHONPYCACHEPREFIX=/private/tmp/speed_pycache python3 -m py_compile SPEED-main/FLux/CE_Flux.py
-```
 
 最小运行验证：
 
@@ -62,11 +58,9 @@ python3 CE_Flux.py \
   --exp_name "smoke_snoopy"
 ```
 
-这个验证只能说明编辑流程是否能跑通，并不能说明概念擦除成功。真正的实验验证还需要加载 `.safetensors` 后生成图像，对比 `target_concepts` 是否减弱，以及非目标概念是否被明显破坏。
-
 ## 待确认
 
-- 昨日实现是否已经在 GPU 上完整跑通过。
+- 实现是否已经在 GPU 上完整跑通过。
 - `models/*.safetensors` 是否已有实际输出。
 - q/k 编辑是否足够，还是需要扩展到更多 FLUX attention 模块。
 - `anchor_concepts` 为空时使用 `retain_concepts` 作为 anchor 来源是否合理。
