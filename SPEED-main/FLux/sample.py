@@ -20,13 +20,6 @@ def load_flux_pipeline(model_id, device, torch_dtype):
     return pipe 
 
 
-def load_flux_pipeline(model_id, device, torch_dtype):
-    pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)
-    pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
-    return pipe
-
-
 def flux_generate(pipe, prompt, seeds, args, desc=None):
     images = []
     for seed in seeds:
