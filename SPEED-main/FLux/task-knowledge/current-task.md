@@ -40,8 +40,6 @@
 
 ## 验证方式
 
-
-
 最小运行验证：
 
 ```bash
@@ -63,5 +61,37 @@ python3 CE_Flux.py \
 - 实现是否已经在 GPU 上完整跑通过。
 - `models/*.safetensors` 是否已有实际输出。
 - q/k 编辑是否足够，还是需要扩展到更多 FLUX attention 模块。
-- `anchor_concepts` 为空时使用 `retain_concepts` 作为 anchor 来源是否合理。
 - 现有 `sample.py` 和 `scripts/` 是否计划迁移到 FLUX，还是应另写新脚本。
+
+## 2026-07-05
+
+
+这一阶段的任务重点是重构闭式解公式，并围绕新公式重新跑实验、调整参数。核心变化包括：
+
+- `_closed_form_update` 不再只是普通闭式最小二乘，而是引入 retain 输入协方差和 SVD 零空间投影。
+- `threshold` 用于决定哪些 retain 协方差方向被视作可更新零空间。
+- `update_lambda` 保留为 ridge 正则，用于稳定求解。
+- `residual_scale` 被作为主要强度参数反复调整。
+- 重新跑 Van Gogh/style 和 Snoopy/instance 等实验，比较不同参数下的擦除效果和副作用。
+- 实验命令必须显式记录 `--params`、`--residual_scale`、`--update_lambda`、`--threshold`，否则结果不可比较。
+
+当前需要继续推进的模块：
+
+- `CE_Flux.py`：确认重构后的闭式解、retain 过滤、零空间投影和逐层 residual 分摊是否稳定。
+- 实验配置：围绕 `style_100.csv`、`instance_small.csv` 重跑小规模实验。
+- 参数搜索：比较 `QK`、`KV`、`QKV`，并调整 `residual_scale`、`update_lambda`、`threshold`。
+- `sample.py`：继续作为验证链路的一部分
+
+待确认问题：
+
+- 重构后的零空间投影是否确实降低 retain 副作用。
+- `QKV` 是否比 `QK` 擦除更强，但副作用也更大。
+- `KV` 是否可能比 `QK` 更适合作为默认配置。
+- `residual_scale=9/10` 这类强配置是否会破坏 retain 概念。
+- 空 anchor `""` 是否应作为长期默认配置，还是只用于 null-anchor 对照实验。
+- `threshold=1e-1` 和 `update_lambda=1e-3` 是否适合作为重跑实验的默认起点。
+
+
+
+
+

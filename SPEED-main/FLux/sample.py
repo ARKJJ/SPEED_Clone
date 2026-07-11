@@ -1,24 +1,23 @@
-import warnings
-warnings.filterwarnings("ignore")
-import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-import re
-import copy
-import argparse
-from PIL import Image
+import warnings  
+warnings.filterwarnings("ignore")  
+import os 
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'  
+import re  
+import copy  
+import argparse 
+from PIL import Image  
 
-import torch
-from diffusers import DiffusionPipeline
-from safetensors.torch import load_file
-from src.template import template_dict
-from src.utils import seed_everything
+import torch  
+from diffusers import DiffusionPipeline  
+from safetensors.torch import load_file  
+from src.template import template_dict  
+from src.utils import seed_everything 
 
-
-def load_flux_pipeline(model_id, device, torch_dtype):
-    pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)
-    pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
-    return pipe
+def load_flux_pipeline(model_id, device, torch_dtype):  
+    pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)  
+    pipe.vae.enable_slicing() 
+    pipe.vae.enable_tiling() 
+    return pipe 
 
 
 def flux_generate(pipe, prompt, seeds, args, desc=None):

@@ -45,7 +45,6 @@
 - `SPEED-main/FLux/CE_Flux.py`
 - `SPEED-main/FLux/sample.py`
 
-
 验证结果：
 - 目前尚未完成真实 FLUX pipeline/GPU 运行验证；现阶段验证只覆盖文件结构、静态代码逻辑和日志写入。
 
@@ -62,11 +61,10 @@
 - 在最小流程确认可运行后，再扩展到多层、多概念和 retain 消融实验。
 
 需要人工确认的地方：
-- anchor 为空时，是使用 null-anchor、retain 均值，还是必须显式指定 anchor concept。
 - 后续效果验证采用人工看图、CLIP 相似度。
 
-
-  CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
+```bash
+CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
   --target_concepts "Van Gogh" \
   --anchor_concepts "painting" \
   --retain_path "FLux/data/style_100.csv" \
@@ -78,7 +76,7 @@
   --update_lambda 1e-3 \
   --threshold 1e-1
 
-  CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
+CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
   --mode original,edit \
   --erase_type style \
   --target_concept "Van Gogh" \
@@ -90,10 +88,7 @@
   --batch_size 5 \
   --strict_edit_load
 
-
-
-
-  CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
+CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
   --target_concepts "Snoopy" \
   --anchor_concepts "" \
   --retain_path "FLux/data/instance_small.csv" \
@@ -105,7 +100,7 @@
   --update_lambda 1e-3 \
   --threshold 1e-1
 
-  CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
+CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
   --mode original,edit \
   --erase_type instance \
   --target_concept "Snoopy" \
@@ -117,7 +112,7 @@
   --batch_size 5 \
   --strict_edit_load
 
-  CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
+CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
   --mode original,edit \
   --erase_type instance \
   --target_concept "Snoopy" \
@@ -128,3 +123,64 @@
   --num_samples 20 \
   --batch_size 5 \
   --strict_edit_load
+```
+
+## 2026-07-04
+
+### 阶段目标
+
+这一阶段的重点是重构闭式解公式，让 FLUX 版编辑不只是简单地把 target 输出拉向 anchor，而是把 retain 约束更明确地写进权重更新空间。也就是说，核心工作从“能算出 delta”推进到“delta 应该落在哪个子空间、如何减少对 retain 概念的副作用”。
+
+### 进展
+
+- 重构 `_closed_form_update` 的计算方式，引入 retain 输入协方差矩阵。
+- 使用 retain 输入的 SVD 结果构造近似零空间，将更新限制到更不影响 retain 概念的方向。
+- 将 `threshold` 明确为选择 retain 零空间方向的阈值，而不是普通的经验开关。
+- 保留 ridge 项 `update_lambda`，用于稳定闭式线性系统求解。
+- 将 residual 按剩余同类模块数分摊，避免每一层都一次性承担完整输出偏移。
+- 将 retain 文本来源固定为 `--retain_path` 加 `--heads`，便于后续重跑实验时保持相同保护集合。
+
+### 观察
+
+- 闭式解的效果对 `threshold` 很敏感：阈值越大，可更新子空间越小，retain 保护可能更强，但目标擦除也可能变弱。
+- `update_lambda` 过小时容易放大不稳定方向，过大时会压低编辑强度。
+- `residual_scale` 实际上承担了“擦除强度旋钮”的作用，需要和 `params`、`threshold` 联合调。
+
+### 待继续
+
+- 用相同 target/anchor/retrain 配置重跑实验，比较重构闭式解前后的生成效果。
+- 对 `QK`、`KV`、`QKV` 分别调参，观察擦除强度和 retain 副作用。
+- 优先记录 Van Gogh/style 和 Snoopy/instance 两类实验，因为它们分别代表风格擦除和对象擦除。
+
+## 2026-07-07
+
+### 阶段目标
+
+这一阶段的重点是围绕重构后的闭式解重新跑实验，并根据生成结果调整参数。目标不是一次性确定最优配置，而是建立一组可比较的实验：同一 target/anchor/retain 下，只改变 `params`、`residual_scale`、`update_lambda` 或 `threshold`。
+
+### 进展
+
+- 重新跑了风格类实验，例如将 `Van Gogh` 引导到 `painting`，并使用 `style_100.csv` 作为 retain 集合。
+- 重新跑了对象类实验，例如 `Snoopy` 的 null-anchor/object 擦除，并使用 `instance_small.csv` 作为 retain 集合。
+- 尝试提高 `residual_scale`，例如 `r9`、`r10` 这类配置，用于增强目标概念削弱效果。
+- 尝试把 `update_lambda` 调到 `1e-3`，增强线性系统的数值稳定性。
+- 对 `QK` 和 `QKV` 等模块组合进行比较，观察更强编辑范围是否带来更明显擦除和更多副作用。
+- 对 retain 概念单独采样，例如在 Snoopy 编辑后检查 Hello Kitty，观察非目标概念是否被破坏。
+
+### 当前问题
+
+- 参数之间存在耦合：`QKV + 高 residual_scale` 可能更强，但 retain 副作用也更需要关注。
+- 风格擦除和对象擦除对参数的敏感性可能不同，不能直接共用同一组超参数结论。
+
+### 下一步
+
+- 固定一组最小 benchmark：Van Gogh/style、Snoopy/instance、一个 retain concept 对照。
+- 把每次实验的 `params`、`residual_scale`、`update_lambda`、`threshold` 写入文件名或日志。
+- 根据重跑结果决定默认配置是否从 `QK` 转向 `KV` 或 `QKV`。
+- 保留 `sample.py` 加载链路检查
+
+## 2026-07-11
+
+
+
+
