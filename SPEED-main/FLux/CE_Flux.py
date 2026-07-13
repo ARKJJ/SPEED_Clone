@@ -89,17 +89,8 @@ def _mean_outputs(traces, concepts, module_name):
     return None if not outputs else torch.cat(outputs, dim=1).mean(dim=1, keepdim=True)
 
 
-def _closed_form_update(keys, residuals, update_lambda, retain_inputs, retain_threshold=1e-1, disable_filter=False):
+def _closed_form_update(keys, residuals, update_lambda, retain_inputs, retain_threshold=1e-1):
     retain_inputs = retain_inputs.to(device=keys.device, dtype=keys.dtype)
-    if not disable_filter:
-        eye = torch.eye(keys.shape[0], device=keys.device, dtype=keys.dtype)
-        system_init = keys @ keys.T + update_lambda * eye
-        delta_init = torch.linalg.solve(system_init.T, (residuals @ keys.T).T).T
-        weight_norm_init = (delta_init @ retain_inputs).norm(dim=0)
-        keep_mask = weight_norm_init > weight_norm_init.mean()
-        if keep_mask.any():
-            retain_inputs = retain_inputs[:, keep_mask]
-
     covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
     U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
     null_basis = U[:, S < retain_threshold]
@@ -195,7 +186,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             args.update_lambda,
             retain_inputs.to(module.weight.device, torch.float32),
             args.threshold,
-            disable_filter=args.disable_filter,
         )
         module.weight = torch.nn.Parameter(module.weight.float().add(delta).to(module.weight.dtype))
         edit_dict[module_name + ".weight"] = module.weight.detach().clone()
@@ -223,7 +213,6 @@ if __name__ == "__main__":
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=1e-4)
     parser.add_argument("--residual_scale", type=float, default=1.0)
-    parser.add_argument("--disable_filter", action="store_true", default=False)
     args = parser.parse_args()
 
     target_concepts = [con.strip() for con in args.target_concepts.split(",")]

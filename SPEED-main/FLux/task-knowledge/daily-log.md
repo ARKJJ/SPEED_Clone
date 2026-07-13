@@ -181,6 +181,37 @@ CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
 
 ## 2026-07-11
 
+### 阶段目标
 
+在当前 FLUX 版 `CE_Flux.py` 中补入 SPEED 的 IPF 思想：先精炼 retain set，再用精炼后的 retain inputs 构造零空间 projector。实现要求是尽量贴近 SPEED 原版做法，同时避免把逻辑拆成过多新函数。
+
+### 完成内容
+
+- 在 `CE_Flux.py` 的 `_closed_form_update(...)` 内部加入 IPF retain refinement。
+- 默认启用 IPF；新增 `--disable_filter`，用于关闭 IPF 并回退到原来的全 retain set 零空间构造路径。
+- IPF 打分方式与 SPEED 原版保持同构：
+  - SPEED SD 版使用 `ret_embs @ erase_weight.T` 的范数筛 retain。
+  - FLUX 版没有同一个静态 `erase_weight`，因此先用当前 `keys/residuals` 估计未投影的初始编辑方向 `delta_init`。
+  - 再用 `(delta_init @ retain_inputs).norm(dim=0)` 作为 retain token 影响分数。
+  - 保留 `score > score.mean()` 的 retain inputs，用于后续 covariance/SVD/null-space projector。
+- 为防止极端情况下所有 score 相同导致筛空，加入轻量保护：如果 `keep_mask` 为空，则保留原 retain set。
+- 将 IPF 初始方向的求解从 hidden 维度大矩阵 solve 改为等价 dual form，只解 token/sample 维度小矩阵，减少 FLUX 多层编辑时的额外开销。
+
+### 修改文件
+
+- `SPEED-main/FLux/CE_Flux.py`
+
+### 验证
+
+`_closed_form_update` 的两个行为：
+  - 默认路径会使用 IPF 精炼后的 retain set。
+  - `disable_filter=True` 时保持原来的 unfiltered retain 行为。
+- 已运行：
+
+
+### 尚未验证
+
+- 尚未运行真实 FLUX pipeline/GPU 编辑与采样验证。
+- 后续仍需要用固定 target/anchor/retain 配置比较启用 IPF 与 `--disable_filter` 的生成效果、retain 副作用和运行耗时。
 
 
