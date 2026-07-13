@@ -99,10 +99,10 @@ def _closed_form_update(keys, residuals, update_lambda, retain_inputs, retain_th
     else:
         projector = null_basis @ null_basis.T
     projected_keys = projector @ keys
-    eye = torch.eye(projected_keys.shape[0], device=projected_keys.device, dtype=projected_keys.dtype)
-    system = projected_keys @ projected_keys.T + update_lambda * eye
+    eye = torch.eye(keys.shape[0], device=keys.device, dtype=keys.dtype)
+    system = keys @ projected_keys.T + update_lambda * eye
     delta = torch.linalg.solve(system.T, (residuals @ projected_keys.T).T).T
-    return delta @ projector
+    return delta 
 
 
 def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=256,):
