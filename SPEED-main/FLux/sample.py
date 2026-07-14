@@ -91,7 +91,7 @@ def main():
     pipe_edit = None
     if 'edit' in mode_list:
         pipe_edit = copy.deepcopy(pipe) if 'original' in mode_list else pipe
-        edit_path = args.edit_ckpt or os.path.join("models", sorted(os.listdir("models"))[-1])
+        edit_path = args.edit_ckpt or os.path.join("logs/checkpoints", sorted(os.listdir("logs/checkpoints"))[-1])
         edit_state_dict = load_file(edit_path, device='cpu')
         transformer_state = pipe_edit.transformer.state_dict()
         for key, value in edit_state_dict.items():

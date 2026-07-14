@@ -172,21 +172,15 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             concept_trace = edit_traces[concept]
             final_current = concept_trace[final_module_name]["outputs"]
             anchor_final_mean = anchor_final_means[final_module_name][anchor_concept]
-            target = anchor_final_mean.to(final_current.device, final_current.dtype).expand(-1, final_current.shape[1])
+            anchor = anchor_final_mean.to(final_current.device, final_current.dtype).expand(-1, final_current.shape[1])
             keys.append(concept_trace[module_name]["inputs"])
-            residuals.append((target - final_current) * (args.residual_scale / remaining_count))
+            residuals.append((anchor - final_current) * (args.residual_scale / remaining_count))
 
         keys = torch.cat(keys, dim=1).to(module.weight.device, torch.float32)
         residuals = torch.cat(residuals, dim=1).to(module.weight.device, torch.float32)
         retain_inputs = retain_inputs_by_module[module_name]
 
-        delta = _closed_form_update(
-            keys,
-            residuals,
-            args.update_lambda,
-            retain_inputs.to(module.weight.device, torch.float32),
-            args.threshold,
-        )
+        delta = _closed_form_update(keys,residuals,args.update_lambda,retain_inputs.to(module.weight.device, torch.float32),args.threshold,p)
         module.weight = torch.nn.Parameter(module.weight.float().add(delta).to(module.weight.dtype))
         edit_dict[module_name + ".weight"] = module.weight.detach().clone()
         print(f"  Updated {module_name} | ||delta||={delta.norm().item():.4f}")
