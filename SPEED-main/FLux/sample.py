@@ -67,7 +67,7 @@ def main():
     parser.add_argument('--prompts', type=str, default=None)
     parser.add_argument('--height', type=int, default=512)
     parser.add_argument('--width', type=int, default=512)
-    parser.add_argument('--max_sequence_length', type=int, default=None)
+    parser.add_argument('--max_sequence_length', type=int, default=512)
     parser.add_argument('--erase_type', type=str, default='', help='instance, style, celebrity')
     parser.add_argument('--target_concept', type=str, default='')
     parser.add_argument('--contents', type=str, default='')
@@ -76,8 +76,6 @@ def main():
 
     mode_list = args.mode.replace(' ', '').split(',')
     model_id = args.model_id or args.sd_ckpt
-    if args.max_sequence_length is None:
-        args.max_sequence_length = 256 if 'schnell' in model_id.lower() else 512
     dtype_map = {
         'float16': torch.float16,
         'bfloat16': torch.bfloat16,

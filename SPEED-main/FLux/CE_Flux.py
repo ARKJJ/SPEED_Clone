@@ -63,7 +63,7 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
                 concept,
                 generator=generator,
                 num_inference_steps=args.trace_num_steps,
-                guidance_scale=0.0,
+                guidance_scale=3.5,
                 height=args.trace_resolution,
                 width=args.trace_resolution,
                 max_sequence_length=max_sequence_length,
@@ -105,7 +105,7 @@ def _closed_form_update(keys, residuals, update_lambda, retain_inputs, retain_th
     return delta 
 
 
-def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=256,):
+def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512,):
     edit_modules, selected_suffixes = _select_text_attention_modules(pipeline.transformer, device, args.params)
     module_names = [name for name, _, _ in edit_modules]
     edit_module_suffixes = [suffix for _, _, suffix in edit_modules]
@@ -118,27 +118,33 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         remaining_counts[module_index] = suffix_counts[suffix]
         final_modules.setdefault(suffix, module_names[module_index])
 
-    retain_texts = [
-        text for text in retain_texts
-        if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", text.lower()) for concept in target_concepts)
-    ]
-
-    token_indices = {}
-    for concept in anchor_concepts + retain_texts:
+    anchor_token_indices = {}
+    for concept in anchor_concepts:
         concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
-        token_count = max(int(concept_inputs.attention_mask.sum().item()) - 1, 0)
-        token_indices[concept] = [0] if concept == "" and token_count == 0 else list(range(token_count))
+        anchor_token_indices[concept] = [int(concept_inputs.attention_mask.sum().item()) - 2]
+
+    retain_token_indices = {}
+    for concept in retain_texts:
+        concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
+        if concept == "":
+            retain_token_indices[concept] = list(range(1, concept_inputs.input_ids.shape[1]))
+        else:
+            retain_token_indices[concept] = [int(concept_inputs.attention_mask.sum().item()) - 2]
+
+    target_token_indices = {}
     for concept in target_concepts:
         concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
-        token_count = max(int(concept_inputs.attention_mask.sum().item()) - 1, 0)
-        token_indices[concept] = list(range(token_count))
+        if target_concepts == ["nudity"]:
+            target_token_indices[concept] = list(range(1, max(int(concept_inputs.attention_mask.sum().item()) - 1, 1)))
+        else:
+            target_token_indices[concept] = [int(concept_inputs.attention_mask.sum().item()) - 2]
 
     print("\nSelected text-side attention modules:")
     for name in module_names:
         print(f"  {name}")
 
     final_module_names = [final_modules[suffix] for suffix in selected_suffixes if suffix in final_modules]
-    anchor_final_traces = _trace_concepts(pipeline, anchor_concepts, token_indices, final_module_names, args, device, max_sequence_length)
+    anchor_final_traces = _trace_concepts(pipeline, anchor_concepts, anchor_token_indices, final_module_names, args, device, max_sequence_length)
     anchor_final_means = {
         module_name: {
             anchor_concept: _mean_outputs(anchor_final_traces, [anchor_concept], module_name)
@@ -147,25 +153,30 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         for module_name in final_module_names
     }
 
-    retain_traces = _trace_concepts(pipeline, retain_texts, token_indices, module_names, args, device, max_sequence_length)
-    retain_inputs_by_module = {}
+    retain_inputs_by_module = {module_name: [] for module_name in module_names}
+    for j in range(0, len(retain_texts), args.chunk_size):
+        retain_chunk = retain_texts[j:j + args.chunk_size]
+        retain_traces = _trace_concepts(pipeline, retain_chunk, retain_token_indices, module_names, args, device, max_sequence_length)
+        for module_name in module_names:
+            retain_inputs = [
+                retain_traces[concept][module_name]["inputs"]
+                for concept in retain_chunk
+                if concept in retain_traces and module_name in retain_traces[concept]
+            ]
+            if retain_inputs:
+                retain_inputs_by_module[module_name].append(torch.cat(retain_inputs, dim=1))
+        del retain_traces
     for module_name in module_names:
-        retain_inputs = [
-            retain_traces[concept][module_name]["inputs"]
-            for concept in retain_texts
-            if concept in retain_traces and module_name in retain_traces[concept]
-        ]
-        if not retain_inputs:
+        if not retain_inputs_by_module[module_name]:
             raise RuntimeError(f"No retain trace for {module_name}")
-        retain_inputs_by_module[module_name] = torch.cat(retain_inputs, dim=1)
+        retain_inputs_by_module[module_name] = torch.cat(retain_inputs_by_module[module_name], dim=1)
 
     edit_dict = {}
-
     for module_index, (module_name, module, suffix) in enumerate(edit_modules):
         final_module_name = final_modules[suffix]
 
         trace_module_names = list(dict.fromkeys([module_name, final_module_name]))
-        edit_traces = _trace_concepts(pipeline, target_concepts, token_indices, trace_module_names, args, device, max_sequence_length)
+        edit_traces = _trace_concepts(pipeline, target_concepts, target_token_indices, trace_module_names, args, device, max_sequence_length)
         remaining_count = remaining_counts[module_index]
         keys, residuals = [], []
         for concept, anchor_concept in zip(target_concepts, anchor_concepts):
@@ -200,6 +211,7 @@ if __name__ == "__main__":
     parser.add_argument("--anchor_concepts", type=str, required=True)
     parser.add_argument("--retain_path", type=str, default=None)
     parser.add_argument("--heads", type=str, default=None)
+    parser.add_argument("--chunk_size", type=int, default=128)
     parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
     parser.add_argument("--threshold", type=float, default=1e-1)
     parser.add_argument("--trace_num_steps", type=int, default=20)
@@ -224,25 +236,21 @@ if __name__ == "__main__":
         else:
             file_suffix += f"-to_{anchor_concepts[0]}"
     else:
-        if len(target_concepts) != len(anchor_concepts):
-            raise ValueError("target_concepts and anchor_concepts must have the same length")
-        file_suffix += f"-to_{anchor_concepts[0]}_etc"
+        assert len(target_concepts) == len(anchor_concepts)
+        file_suffix += f'-to_{anchor_concepts[0]}_etc'
 
     retain_texts = []
     if retain_path is not None:
-        if not retain_path.endswith(".csv"):
-            raise ValueError("--retain_path must be a .csv file")
-        if args.heads is None:
-            raise ValueError("--heads is required when --retain_path is used")
+        assert retain_path.endswith('.csv')
         df = pd.read_csv(retain_path)
-        for head in args.heads.split(","):
+        for head in args.heads.split(','):
             retain_texts += df[head.strip()].unique().tolist()
     else:
         retain_texts.append("")
-
-    save_path = args.save_path or "logs/checkpoints"
-    file_name = args.file_name or f"{time.strftime('%Y%m%d-%H%M%S')}-{file_suffix}"
-    max_sequence_length = 256 if "schnell" in args.sd_ckpt else 512
+    retain_texts = [
+        text for text in retain_texts
+        if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", text.lower()) for concept in target_concepts)
+    ]
 
     pipeline = DiffusionPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
     edit_dict = edit_model(
@@ -252,7 +260,10 @@ if __name__ == "__main__":
         anchor_concepts=anchor_concepts,
         retain_texts=retain_texts,
         device=args.device,
-        max_sequence_length=max_sequence_length,
+        max_sequence_length=512,
     )
+
+    save_path = args.save_path or "logs/checkpoints"
+    file_name = args.file_name or f"{time.strftime('%Y%m%d-%H%M%S')}-{file_suffix}"
     os.makedirs(save_path, exist_ok=True)
     save_file(edit_dict, os.path.join(save_path, f"{file_name}.safetensors"))
