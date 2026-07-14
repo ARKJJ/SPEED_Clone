@@ -191,7 +191,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.1-schnell")
+    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--file_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -202,7 +202,7 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=str, default=None)
     parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
     parser.add_argument("--threshold", type=float, default=1e-1)
-    parser.add_argument("--trace_num_steps", type=int, default=4)
+    parser.add_argument("--trace_num_steps", type=int, default=20)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=1e-4)
