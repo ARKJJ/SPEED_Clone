@@ -206,7 +206,6 @@ CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
 `_closed_form_update` 的两个行为：
   - 默认路径会使用 IPF 精炼后的 retain set。
   - `disable_filter=True` 时保持原来的 unfiltered retain 行为。
-- 已运行：
 
 
 ### 尚未验证

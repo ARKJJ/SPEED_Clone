@@ -180,7 +180,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         residuals = torch.cat(residuals, dim=1).to(module.weight.device, torch.float32)
         retain_inputs = retain_inputs_by_module[module_name]
 
-        delta = _closed_form_update(keys,residuals,args.update_lambda,retain_inputs.to(module.weight.device, torch.float32),args.threshold,p)
+        delta = _closed_form_update(keys, residuals, args.update_lambda, retain_inputs.to(module.weight.device, torch.float32), args.threshold)
         module.weight = torch.nn.Parameter(module.weight.float().add(delta).to(module.weight.dtype))
         edit_dict[module_name + ".weight"] = module.weight.detach().clone()
         print(f"  Updated {module_name} | ||delta||={delta.norm().item():.4f}")

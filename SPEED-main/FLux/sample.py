@@ -7,11 +7,21 @@ import copy
 import argparse 
 from PIL import Image  
 
-import torch  
+import random
+import torch
+import numpy as np
 from diffusers import DiffusionPipeline  
 from safetensors.torch import load_file  
-from src.template import template_dict  
-from src.utils import seed_everything 
+from template import template_dict  
+
+def seed_everything(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 def load_flux_pipeline(model_id, device, torch_dtype):  
     pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)  
