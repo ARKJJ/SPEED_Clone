@@ -94,9 +94,9 @@ CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
   --retain_path "FLux/data/instance_small.csv" \
   --heads "concept" \
   --save_path "FLux/models" \
-  --file_name "erase_snoopy_to_dog_QKV_r9" \
-  --params QKV \
-  --residual_scale 9.0 \
+  --file_name "erase_snoopy_to_null_KV_r8" \
+  --params KV \
+  --residual_scale 8.0 \
   --update_lambda 1e-3 \
   --threshold 1e-1
 
@@ -105,12 +105,11 @@ CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
   --erase_type instance \
   --target_concept "Snoopy" \
   --contents "Snoopy" \
-  --edit_ckpt "FLux/models/erase_snoopy_to_dog_QKV_r9.safetensors" \
-  --save_root "FLux/results_snoopy_to_null_QKV_r9" \
-  --prompts "a photo of {}; {} in a park; {} character" \
-  --num_samples 20 \
-  --batch_size 5 \
-  --strict_edit_load
+  --edit_ckpt "FLux/models/erase_snoopy_to_null_KV_r8.safetensors" \
+  --save_root "FLux/results_snoopy_to_null_KV_r8" \
+  --num_samples 2 \
+  --batch_size 5 
+  
 
 CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
   --mode original,edit \
@@ -213,4 +212,121 @@ CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
 - 尚未运行真实 FLUX pipeline/GPU 编辑与采样验证。
 - 后续仍需要用固定 target/anchor/retain 配置比较启用 IPF 与 `--disable_filter` 的生成效果、retain 副作用和运行耗时。
 
+## 2026-07-14
 
+### 阶段目标
+
+梳理 FLUX 版 `CE_Flux.py` 中 T5 文本 token 的选择策略，先做一个更接近 SPEED 思路的消融：普通概念不再默认使用全体有效 token，而是用单个主体 token 表示概念，从而减少 trace token 数、闭式解样本列数和 retain covariance 的计算量。
+
+### 完成内容
+
+- 讨论了 CLIP 和 T5 encoder 的差异：CLIP text transformer 的 causal attention 让后方 token 更容易聚合前文信息，而 T5 encoder 是双向 attention，每个 token 都能看全句，因此最后 token 没有天然汇聚优势。
+- 将 `target_concepts` 和 `anchor_concepts` 放在同一个 paired loop 中选择 token。
+- 普通 `anchor_concepts` 的 token 选择改为首个有效 token：
+  - 使用 `int(concept_inputs.attention_mask[0].argmax().item())` 从 `attention_mask` 中定位第一个有效 token。
+- 将非空 `retain_texts` 的 token 选择改为首个有效 token。
+- 保留空 retain 的原始行为：
+  - `concept == ""` 时使用 `list(range(0, concept_inputs.input_ids.shape[1]))`，避免 T5 无 BOS 时跳过 index 0 的 null token。
+  - 这样 null/empty preserve 路径暂时不引入新的实验变量。
+- 将普通 `target_concepts` 的 token 选择改为首个有效 token。
+- 保留 `target_concepts == ["nudity"]` 的 SPEED-style 全 token span 行为：
+  - `nudity` 时 target 和 anchor 都使用 `list(range(0, concept_inputs.input_ids.shape[1]))`，避免 T5 无 BOS 时跳过 index 0 的主体 token。
+  - 这样 target/anchor 的 trace 列数保持一致，后续可以逐 token/逐 step 计算 residual，避免 target 多 token 而 anchor 单 token 的 shape mismatch。
+
+
+### 修改文件
+
+- `SPEED-main/FLux/CE_Flux.py`
+
+### 当前 token 选择规则
+
+- anchor：普通概念取首个有效 token；`nudity` 分支下与 target 一起取全 token span。
+- retain 非空文本：首个有效 token。
+- retain 空文本：沿用原来的多 token/null retain 逻辑。
+- target 普通概念：首个有效 token。
+- target 为 `nudity`：target 和 anchor 都沿用全 token span 逻辑。
+
+### 验证
+
+- 已运行 `python -m py_compile FLux/CE_Flux.py`，语法检查通过。
+
+### 待验证
+
+- 仍需运行真实 FLUX pipeline/GPU 编辑，比较首个主体 token 与原先最后主体 token/多 token 策略下的擦除强度、retain 副作用和运行耗时。
+- 后续可以进一步整理为显式 CLI 消融参数，例如 `first`、`last`、`span`、`mean`，但当前先保持最小改动。
+CUDA_VISIBLE_DEVICES=1 python FLux/CE_Flux.py \
+  --sd_ckpt "black-forest-labs/FLUX.1-dev" \
+  --device "cuda:0" \
+  --target_concepts "Snoopy" \
+  --anchor_concepts "" \
+  --retain_path "FLux/data/instance_small.csv" \
+  --heads "concept" \
+  --save_path "FLux/logs/checkpoints" \
+  --file_name "erase_snoopy_to_null_QK_r10_t10" \
+  --params QK \
+  --trace_num_steps 10 \
+  --residual_scale 10
+
+CUDA_VISIBLE_DEVICES=1 python FLux/sample.py \
+  --sd_ckpt "black-forest-labs/FLUX.1-dev" \
+  --mode "original,edit" \
+  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_QK_r10_t10.safetensors" \
+  --save_root "FLux/logs/FLUX/instanceQK10" \
+  --erase_type "instance" \
+  --target_concept "Snoopy" \
+  --contents "Snoopy" \
+  --num_samples 2 \
+  --batch_size 4
+
+CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
+  --sd_ckpt "black-forest-labs/FLUX.1-dev" \
+  --mode "original,edit" \
+  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_V_r6_t10.safetensors" \
+  --save_root "FLux/logs/FLUX/instanceV6" \
+  --erase_type "instance" \
+  --target_concept "Snoopy" \
+  --contents "Mickey, Spongebob, Pikachu, Hello Kitty" \
+  --num_samples 2 \
+  --batch_size 4
+
+CUDA_VISIBLE_DEVICES=1 python FLux/CE_Flux.py \
+  --sd_ckpt "black-forest-labs/FLUX.1-dev" \
+  --device "cuda:0" \
+  --target_concepts "Van Gogh" \
+  --anchor_concepts "painting" \
+  --retain_path "FLux/data/style_100.csv" \
+  --heads "concept" \
+  --save_path "FLux/logs/checkpoints" \
+  --file_name "erase_vangogh_to_painting_V_r8_t10" \
+  --params V \
+  --trace_num_steps 10 \
+  --residual_scale 8
+
+  CUDA_VISIBLE_DEVICES=1 python FLux/sample.py \
+  --sd_ckpt "black-forest-labs/FLUX.1-dev" \
+  --mode "original,edit" \
+  --edit_ckpt "FLux/logs/checkpoints/erase_vangogh_to_painting_V_r8_t10.safetensors" \
+  --save_root "FLux/logs/FLUX/styleV8" \
+  --erase_type "style" \
+  --target_concept "Van Gogh" \
+  --contents "Van Gogh" \
+  --num_samples 2 \
+  --batch_size 4
+
+  ### 目前已测试参数
+  10个timestep联合约束
+  instanace erasure
+  QK r=10 snoopy擦除效果弱
+  KV r=10 snoopy擦除效果弱
+  QKV r=10 snoopy在部分prompt下表现差，擦除效果不明显
+  V r=10 snoopy擦除效果明显
+
+  style erasure
+  KV r=5 擦除效果可以   r=10 画面退化严重
+  
+  CUDA_VISIBLE_DEVICES=1 python test_fluxdev_generate.py \
+  --prompt "Van Gogh style cliffs along the coastline with blended sea and sky" \
+  --device cuda:0 \
+  --total_timesteps 8 \
+  --height 384 \
+  --width 384

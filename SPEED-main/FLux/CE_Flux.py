@@ -37,56 +37,62 @@ def _select_text_attention_modules(transformer, device, params):
 def _trace_concepts(pipeline, concepts, token_indices, module_names, args, device, max_sequence_length):
     module_lookup = dict(pipeline.transformer.named_modules())
     traced_concepts = {}
+    trace_batch_size = max(1, int(getattr(args, "trace_batch_size", 1)))
+    grouped_concepts = {}
 
     for concept in dict.fromkeys(concepts):
         selected_token_indices = token_indices.get(concept)
         if not selected_token_indices:
             continue
+        grouped_concepts.setdefault(tuple(selected_token_indices), []).append(concept)
 
-        traces = {name: {"inputs": [], "outputs": []} for name in module_names}
-        handles = []
-        for name in module_names:
-            module = module_lookup[name]
+    for selected_token_indices, grouped in grouped_concepts.items():
+        selected_token_indices = list(selected_token_indices)
+        for start in range(0, len(grouped), trace_batch_size):
+            concept_batch = grouped[start:start + trace_batch_size]
+            traces = {name: {"inputs": [], "outputs": []} for name in module_names}
+            handles = []
+            for name in module_names:
+                module = module_lookup[name]
 
-            def pre_hook(_module, inputs, module_name=name):
-                traces[module_name]["inputs"].append(inputs[0][:, selected_token_indices, :].detach().float())
+                def pre_hook(_module, inputs, module_name=name):
+                    traces[module_name]["inputs"].append(inputs[0][:, selected_token_indices, :].detach().float())
 
-            def out_hook(_module, _inputs, output, module_name=name):
-                output = output[0] if isinstance(output, tuple) else output
-                traces[module_name]["outputs"].append(output[:, selected_token_indices, :].detach().float())
+                def out_hook(_module, _inputs, output, module_name=name):
+                    output = output[0] if isinstance(output, tuple) else output
+                    traces[module_name]["outputs"].append(output[:, selected_token_indices, :].detach().float())
 
-            handles.extend([module.register_forward_pre_hook(pre_hook), module.register_forward_hook(out_hook)])
+                handles.extend([module.register_forward_pre_hook(pre_hook), module.register_forward_hook(out_hook)])
 
-        generator = torch.Generator(device=device).manual_seed(args.trace_seed)
-        with torch.no_grad():
-            pipeline(
-                concept,
-                generator=generator,
-                num_inference_steps=args.trace_num_steps,
-                guidance_scale=3.5,
-                height=args.trace_resolution,
-                width=args.trace_resolution,
-                max_sequence_length=max_sequence_length,
-                output_type="latent",
-            )
-        for handle in handles:
-            handle.remove()
+            generators = [
+                torch.Generator(device=device).manual_seed(args.trace_seed)
+                for _ in concept_batch
+            ]
+            with torch.no_grad():
+                pipeline(
+                    concept_batch,
+                    generator=generators,
+                    num_inference_steps=args.trace_num_steps,
+                    guidance_scale=3.5,
+                    height=args.trace_resolution,
+                    width=args.trace_resolution,
+                    max_sequence_length=max_sequence_length,
+                    output_type="latent",
+                )
+            for handle in handles:
+                handle.remove()
 
-        compact = {}
-        for name, record in traces.items():
-            if not record["inputs"] or not record["outputs"]:
-                raise RuntimeError(f"No trace was collected for module '{name}'")
-            compact[name] = {
-                "inputs": torch.cat(record["inputs"], dim=0).reshape(-1, record["inputs"][0].shape[-1]).T,
-                "outputs": torch.cat(record["outputs"], dim=0).reshape(-1, record["outputs"][0].shape[-1]).T,
-            }
-        traced_concepts[concept] = compact
+            for batch_index, concept in enumerate(concept_batch):
+                compact = {}
+                for name, record in traces.items():
+                    input_steps = torch.stack(record["inputs"], dim=0)
+                    output_steps = torch.stack(record["outputs"], dim=0)
+                    compact[name] = {
+                        "inputs": input_steps[:, batch_index, :, :].reshape(-1, input_steps.shape[-1]).T,
+                        "outputs": output_steps[:, batch_index, :, :].reshape(-1, output_steps.shape[-1]).T,
+                    }
+                traced_concepts[concept] = compact
     return traced_concepts
-
-
-def _mean_outputs(traces, concepts, module_name):
-    outputs = [traces[c][module_name]["outputs"] for c in concepts if c in traces and module_name in traces[c]]
-    return None if not outputs else torch.cat(outputs, dim=1).mean(dim=1, keepdim=True)
 
 
 def _closed_form_update(keys, residuals, update_lambda, retain_inputs, retain_threshold=1e-1):
@@ -119,25 +125,24 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         final_modules.setdefault(suffix, module_names[module_index])
 
     anchor_token_indices = {}
-    for concept in anchor_concepts:
-        concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
-        anchor_token_indices[concept] = [int(concept_inputs.attention_mask.sum().item()) - 2]
+    target_token_indices = {}
+    for target_concept, anchor_concept in zip(target_concepts, anchor_concepts):
+        target_inputs = get_token_id(target_concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
+        anchor_inputs = get_token_id(anchor_concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
+        if target_concepts == ["nudity"]:
+            target_token_indices[target_concept] = list(range(0, target_inputs.input_ids.shape[1]))
+            anchor_token_indices[anchor_concept] = list(range(0, anchor_inputs.input_ids.shape[1]))
+        else:
+            target_token_indices[target_concept] = [int(target_inputs.attention_mask[0].argmax().item())]
+            anchor_token_indices[anchor_concept] = [int(anchor_inputs.attention_mask[0].argmax().item())]
 
     retain_token_indices = {}
     for concept in retain_texts:
         concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
         if concept == "":
-            retain_token_indices[concept] = list(range(1, concept_inputs.input_ids.shape[1]))
+            retain_token_indices[concept] = list(range(0, concept_inputs.input_ids.shape[1]))
         else:
-            retain_token_indices[concept] = [int(concept_inputs.attention_mask.sum().item()) - 2]
-
-    target_token_indices = {}
-    for concept in target_concepts:
-        concept_inputs = get_token_id(concept, pipeline.tokenizer_2, max_sequence_length, return_ids_only=False)
-        if target_concepts == ["nudity"]:
-            target_token_indices[concept] = list(range(1, max(int(concept_inputs.attention_mask.sum().item()) - 1, 1)))
-        else:
-            target_token_indices[concept] = [int(concept_inputs.attention_mask.sum().item()) - 2]
+            retain_token_indices[concept] = [int(concept_inputs.attention_mask[0].argmax().item())]
 
     print("\nSelected text-side attention modules:")
     for name in module_names:
@@ -145,13 +150,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
 
     final_module_names = [final_modules[suffix] for suffix in selected_suffixes if suffix in final_modules]
     anchor_final_traces = _trace_concepts(pipeline, anchor_concepts, anchor_token_indices, final_module_names, args, device, max_sequence_length)
-    anchor_final_means = {
-        module_name: {
-            anchor_concept: _mean_outputs(anchor_final_traces, [anchor_concept], module_name)
-            for anchor_concept in dict.fromkeys(anchor_concepts)
-        }
-        for module_name in final_module_names
-    }
 
     retain_inputs_by_module = {module_name: [] for module_name in module_names}
     for j in range(0, len(retain_texts), args.chunk_size):
@@ -182,8 +180,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         for concept, anchor_concept in zip(target_concepts, anchor_concepts):
             concept_trace = edit_traces[concept]
             final_current = concept_trace[final_module_name]["outputs"]
-            anchor_final_mean = anchor_final_means[final_module_name][anchor_concept]
-            anchor = anchor_final_mean.to(final_current.device, final_current.dtype).expand(-1, final_current.shape[1])
+            anchor = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(final_current.device, final_current.dtype)
             keys.append(concept_trace[module_name]["inputs"])
             residuals.append((anchor - final_current) * (args.residual_scale / remaining_count))
 
@@ -212,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--retain_path", type=str, default=None)
     parser.add_argument("--heads", type=str, default=None)
     parser.add_argument("--chunk_size", type=int, default=128)
+    parser.add_argument("--trace_batch_size", type=int, default=4)
     parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
     parser.add_argument("--threshold", type=float, default=1e-1)
     parser.add_argument("--trace_num_steps", type=int, default=20)
