@@ -76,4 +76,4 @@ SPEED 提供研究动机：概念擦除应尽量 scalable、precise、efficient�
 2. 检查输出 `.safetensors` 是否只含预期模块 key。
 3. 修复并验证 `sample.py`，确保同 seed original/edit 可对照。
 4. 比较 `KV`、`QK`、`QKV`。
-5. 再考虑增加 layer 范围参数，做层选择消融。
+

@@ -253,8 +253,7 @@ CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
 ### 待验证
 
 - 仍需运行真实 FLUX pipeline/GPU 编辑，比较首个主体 token 与原先最后主体 token/多 token 策略下的擦除强度、retain 副作用和运行耗时。
-- 后续可以进一步整理为显式 CLI 消融参数，例如 `first`、`last`、`span`、`mean`，但当前先保持最小改动。
-CUDA_VISIBLE_DEVICES=1 python FLux/CE_Flux.py \
+CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
   --sd_ckpt "black-forest-labs/FLUX.1-dev" \
   --device "cuda:0" \
   --target_concepts "Snoopy" \
@@ -262,16 +261,16 @@ CUDA_VISIBLE_DEVICES=1 python FLux/CE_Flux.py \
   --retain_path "FLux/data/instance_small.csv" \
   --heads "concept" \
   --save_path "FLux/logs/checkpoints" \
-  --file_name "erase_snoopy_to_null_QK_r10_t10" \
-  --params QK \
+  --file_name "erase_snoopy_to_null_KV_r4_t10" \
+  --params KV \
   --trace_num_steps 10 \
-  --residual_scale 10
+  --residual_scale 4
 
 CUDA_VISIBLE_DEVICES=1 python FLux/sample.py \
   --sd_ckpt "black-forest-labs/FLUX.1-dev" \
   --mode "original,edit" \
-  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_QK_r10_t10.safetensors" \
-  --save_root "FLux/logs/FLUX/instanceQK10" \
+  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_KV_r4_t10.safetensors" \
+  --save_root "FLux/logs/FLUX/instance_KV4" \
   --erase_type "instance" \
   --target_concept "Snoopy" \
   --contents "Snoopy" \
@@ -281,12 +280,12 @@ CUDA_VISIBLE_DEVICES=1 python FLux/sample.py \
 CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
   --sd_ckpt "black-forest-labs/FLUX.1-dev" \
   --mode "original,edit" \
-  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_V_r6_t10.safetensors" \
-  --save_root "FLux/logs/FLUX/instanceV6" \
+  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_V_r5_t10.safetensors" \
+  --save_root "FLux/logs/FLUX/instanceV5" \
   --erase_type "instance" \
   --target_concept "Snoopy" \
   --contents "Mickey, Spongebob, Pikachu, Hello Kitty" \
-  --num_samples 2 \
+  --num_samples 4 \
   --batch_size 4
 
 CUDA_VISIBLE_DEVICES=1 python FLux/CE_Flux.py \
@@ -317,16 +316,63 @@ CUDA_VISIBLE_DEVICES=1 python FLux/CE_Flux.py \
   10个timestep联合约束
   instanace erasure
   QK r=10 snoopy擦除效果弱
-  KV r=10 snoopy擦除效果弱
+  KV r=10 snoopy擦除效果一般
   QKV r=10 snoopy在部分prompt下表现差，擦除效果不明显
   V r=10 snoopy擦除效果明显
 
   style erasure
   KV r=5 擦除效果可以   r=10 画面退化严重
   
-  CUDA_VISIBLE_DEVICES=1 python test_fluxdev_generate.py \
-  --prompt "Van Gogh style cliffs along the coastline with blended sea and sky" \
-  --device cuda:0 \
-  --total_timesteps 8 \
-  --height 384 \
-  --width 384
+
+## 2026-07-15
+
+### 阶段目标
+
+围绕 FLUX concept erasure 建立一组可复现的参数扫描脚本。当天重点不是确定最终最优超参数，而是先把“编辑权重、采样图片、计算指标”的流程固定下来，方便后续比较 V、KV、QKV 以及不同 `residual_scale` 的影响。
+
+### 完成内容
+
+- 创建 V-only 实例擦除脚本：
+  - 脚本：`FLux/scripts/run_concept_erasure_eval_V.sh`
+  - GPU：`CUDA_VISIBLE_DEVICES=0`
+  - 参数组：`--params V`
+  - `residual_scale` 扫描范围：`r=7..15`
+  - checkpoint 命名：`erase_snoopy_to_null_V_r${r}_t10.safetensors`
+  - 图片输出目录：`FLux/logs/FLUX/instanceV${r}`
+- 创建 KV 实例擦除脚本：
+  - 脚本：`FLux/scripts/run_concept_erasure_eval_KV.sh`
+  - GPU：`CUDA_VISIBLE_DEVICES=1`
+  - 参数组：`--params KV`
+  - `residual_scale` 扫描范围：`r=7..15`
+  - 图片输出目录：`FLux/logs/FLUX/instanceKV${r}`
+- 创建 QKV 实例擦除脚本：
+  - 脚本：`FLux/scripts/run_concept_erasure_eval_QKV.sh`
+  - 参数组：`--params QKV`
+  - `residual_scale` 扫描范围：`r=7..10`
+  - 图片输出目录：`FLux/logs/FLUX/instanceQKV${r}`
+- 统一采样目录命名规则：
+  - 将 `instanceV_r10_t10` 这类目录改为更紧凑的 `instanceV10`、`instanceKV10`、`instanceQKV10`。
+  - checkpoint 文件名仍保留 `V/KV/QKV`、`r` 和 `t10` 信息，便于追踪实验配置。
+- 在 `FLux/score_cal.py` 中加入 baseline CS：
+  - `Edit CS` 表示 edit 图片与 prompt 的 CLIP Score。
+  - `Baseline CS` 表示 original 图片与 prompt 的 CLIP Score。
+  - `FID` 仍然表示 edit 图片与对应 original 图片之间的 FID。
+- 明确当前 FID 口径：
+  - 当前 FLUX 实例脚本计算的是同一次实验中生成的 `edit` 图片和 `original` 图片之间的 FID。
+  - 这不是和真实图片数据集比较的 FID，也不是严格复现论文中的 FID protocol。
+  - 默认 `num_samples=2` 时，每个 instance concept 大约有 `80 * 2 = 160` 张图，FID 可以用来看粗略趋势，但绝对数值方差较大。
+- 创建 SPEED 轻量实例擦除 FID 脚本：
+  - 脚本：`SPEED-main/scripts/run_instance_fid_light_SPEED.sh`
+  - 目标：快速观察原版 SPEED 实例擦除时 edit/original FID 的量级。
+  - 默认目标：`Snoopy`
+  - 默认采样：`num_samples=1`，只作为快速 sanity check。
+
+### 参数记录与观察
+
+- V-only 在早期单概念 Snoopy 擦除检查中效果比较明显，因此优先做 `V, r=7..15` 的较宽扫描。
+- KV 被放到 GPU1 上作为并行对照组，用于观察 K/V 联合编辑是否比 V-only 更稳定。
+- QKV 只先跑 `r=7..10`，因为它编辑的参数范围更大，潜在副作用也更强。
+- 当前设置下 FID 出现 200-300 左右时，不能直接和论文中 20 左右的数值比较，主要原因是样本量更少，且比较对象不同。
+- CS 评测会下载 `openai/clip-vit-large-patch14`，这是用于文图相似度评测的 CLIP 权重，不属于 FLUX 主模型权重。
+
+

@@ -1,0 +1,40 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug CE_Flux",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/SPEED-main/FLux/CE_Flux.py",
+      "cwd": "${workspaceFolder}/SPEED-main",
+      "console": "integratedTerminal",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "--sd_ckpt",
+        "black-forest-labs/FLUX.1-dev",
+        "--device",
+        "cuda:0",
+        "--target_concepts",
+        "Snoopy,Mikey,Hello Kitty",
+        "--anchor_concepts",
+        "",
+        "--retain_path",
+        "FLux/data/instance_small.csv",
+        "--heads",
+        "concept",
+        "--save_path",
+        "FLux/logs/checkpoints",
+        "--file_name",
+        "erase_snoopy_and_to_null_V_r10_t10",
+        "--params",
+        "V",
+        "--trace_num_steps",
+        "10",
+        "--residual_scale",
+        "5"
+      ]
+    }
+  ]
+}

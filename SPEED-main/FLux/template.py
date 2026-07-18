@@ -82,13 +82,32 @@ imagenet_templates = [
 ]
 
 painting_templates = [
+    "{} style oil painting with rough brush strokes and thick impasto texture.",
+    "A painting by {}, featuring bold strokes, heavy paint texture, and expressive brushwork.",
+    "{} style painting with visible brush marks, layered paint, and a traditional canvas texture.",
+    "An oil painting in the style of {}, with thick paint, rough strokes, and vibrant colors.",
+    "{} style artwork with expressive brushwork, impasto technique, and rich color variations.",
+    "A landscape painting by {}, featuring dynamic brush strokes, textured surfaces, and painterly details.",
+    "{} style masterpiece with coarse brushwork, thick layers of paint, and strong color contrasts.",
+    "A canvas painting in the style of {}, using rough strokes, visible paint texture, and impressionist techniques.",
+    "{} style oil painting characterized by impasto, heavy brush marks, and expressive colors.",
+    "A scenic painting by {}, with textured brushwork, thick paint layers, and a handmade canvas appearance.",
+    "{} style painting with loose brush strokes, layered pigments, and dramatic painterly texture.",
+    "An expressive oil painting created in the style of {}, featuring rough textures and bold color application.",
+    "{} style artwork with impressionistic brushwork, thick oil paint, and visible canvas texture.",
+    "A traditional oil painting by {}, showing distinctive brush strokes, textured paint, and artistic composition.",
+    "{} style painting featuring energetic brushwork, impasto texture, and strong visual movement.",
+    "A portrait painting in the style of {}, with rough brush strokes, thick paint, and expressive textures.",
+    "{} style landscape painting with swirling brushwork, layered colors, and rich oil paint texture.",
+    "An impressionist painting by {}, featuring loose strokes, vibrant pigments, and thick textured paint.",
+    "{} style painting with painterly details, uneven brush marks, and three-dimensional paint texture.",
     "{} style painting of the night sky with bold strokes.",
     "{} style landscape of rolling hills with dramatic brushwork.",
     "{} style rural scene with dynamic movement and intensity.",
     "Wheat field under a swirling sky in the style of {}.",
     "{} style transformation of simple cottages into profound scenes.",
-    "Wheat field painting by {}.",
     "City painting in {} style.",
+    "A museum-quality oil painting in the style of {}, with expressive strokes, impasto layers, and unique color palette."
 ]
 
 celebrity_templates = [

@@ -65,6 +65,13 @@ def find_root_paths(root_dir, sub_root):
     )
 
 
+def has_baseline_record(txt_content, content):
+    return any(
+        line.startswith(content + ':') and 'Baseline CS' in line
+        for line in txt_content.splitlines()
+    )
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--contents', type=str)
@@ -89,11 +96,15 @@ if __name__ == '__main__':
             with open(save_txt, 'r') as f:
                 txt_content = f.read()
             for content in tqdm(contents):
-                if content + ':' in txt_content:
+                if has_baseline_record(txt_content, content):
                     continue
                 dataset = Generate_Dataset(root_path, content, args.sub_root)
                 dataloader = DataLoader(dataset, batch_size=10)
                 CS = CS_calculator(dataloader)
+                baseline_root = "data/pretrain/coco" if content == 'coco' else args.pretrained_path
+                baseline_dataset = Generate_Dataset(baseline_root, content, 'original')
+                baseline_dataloader = DataLoader(baseline_dataset, batch_size=10)
+                baseline_CS = CS_calculator(baseline_dataloader)
                 FIDELITY = torch_fidelity.calculate_metrics(
                     input1=os.path.join(root_path, content, args.sub_root),
                     input2=os.path.join(args.pretrained_path, content, 'original') if content != 'coco' else "data/pretrain/coco/coco/original",
@@ -102,6 +113,10 @@ if __name__ == '__main__':
                     verbose=False,
                 )
                 with open(save_txt, 'a') as f:
-                    f.writelines(f"{content}: CS is {CS * 100}, FID is {FIDELITY['frechet_inception_distance']} \n")
+                    f.writelines(
+                        f"{content}: Edit CS is {CS * 100}, "
+                        f"Baseline CS is {baseline_CS * 100}, "
+                        f"FID is {FIDELITY['frechet_inception_distance']} \n"
+                    )
         except Exception as e:
             pass
