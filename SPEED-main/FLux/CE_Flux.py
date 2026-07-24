@@ -16,7 +16,7 @@ ATTENTION_SUFFIXES = {
 
 
 def get_token_id(prompt, tokenizer=None, max_sequence_length=None, return_ids_only=True):
-    token_ids = tokenizer(prompt, padding="max_length", max_length=max_sequence_length or tokenizer.model_max_length, truncation=True, return_tensors="pt")
+    token_ids = tokenizer(prompt, padding="max_length", max_length=max_sequence_length, truncation=True, return_tensors="pt")
     return token_ids.input_ids if return_ids_only else token_ids
 
 
@@ -188,7 +188,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         residuals = torch.cat(residuals, dim=1).to(module.weight.device, torch.float32)
         retain_inputs = retain_inputs_by_module[module_name]
 
-        delta = _closed_form_update(keys, residuals, args.update_lambda, retain_inputs.to(module.weight.device, torch.float32), args.threshold)
+        delta = _closed_form_update(keys, residuals, args.update_lambda * len(target_concepts) * args.trace_num_steps, retain_inputs.to(module.weight.device, torch.float32), args.threshold)
         module.weight = torch.nn.Parameter(module.weight.float().add(delta).to(module.weight.dtype))
         edit_dict[module_name + ".weight"] = module.weight.detach().clone()
         print(f"  Updated {module_name} | ||delta||={delta.norm().item():.4f}")
@@ -215,7 +215,7 @@ if __name__ == "__main__":
     parser.add_argument("--trace_num_steps", type=int, default=20)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
-    parser.add_argument("--update_lambda", type=float, default=1e-4)
+    parser.add_argument("--update_lambda", type=float, default=1.0)
     parser.add_argument("--residual_scale", type=float, default=1.0)
     args = parser.parse_args()
 

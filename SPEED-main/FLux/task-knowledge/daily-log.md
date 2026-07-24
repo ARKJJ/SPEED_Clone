@@ -253,23 +253,23 @@ CUDA_VISIBLE_DEVICES=0 python FLux/sample.py \
 ### 待验证
 
 - 仍需运行真实 FLUX pipeline/GPU 编辑，比较首个主体 token 与原先最后主体 token/多 token 策略下的擦除强度、retain 副作用和运行耗时。
-CUDA_VISIBLE_DEVICES=0 python FLux/CE_Flux.py \
+CUDA_VISIBLE_DEVICES=0 python CE_Flux.py \
   --sd_ckpt "black-forest-labs/FLUX.1-dev" \
   --device "cuda:0" \
   --target_concepts "Snoopy" \
   --anchor_concepts "" \
-  --retain_path "FLux/data/instance_small.csv" \
+  --retain_path "data/instance_small.csv" \
   --heads "concept" \
-  --save_path "FLux/logs/checkpoints" \
-  --file_name "erase_snoopy_to_null_KV_r4_t10" \
-  --params KV \
-  --trace_num_steps 10 \
-  --residual_scale 4
+  --save_path "logs/checkpoints" \
+  --file_name "erase_snoopy_to_null_V_r1" \
+  --params V \
+  --trace_num_steps 20 \
+  --residual_scale 1
 
 CUDA_VISIBLE_DEVICES=1 python FLux/sample.py \
   --sd_ckpt "black-forest-labs/FLUX.1-dev" \
   --mode "original,edit" \
-  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_KV_r4_t10.safetensors" \
+  --edit_ckpt "FLux/logs/checkpoints/erase_snoopy_to_null_V_r4_t10.safetensors" \
   --save_root "FLux/logs/FLUX/instance_KV4" \
   --erase_type "instance" \
   --target_concept "Snoopy" \
