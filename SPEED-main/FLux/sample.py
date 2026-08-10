@@ -14,6 +14,9 @@ from diffusers import DiffusionPipeline
 from safetensors.torch import load_file  
 from template import template_dict  
 
+DEFAULT_MAX_SEQUENCE_LENGTH = 512
+
+
 def seed_everything(seed, deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
@@ -35,7 +38,7 @@ def flux_generate(pipe, prompt, seeds, args, desc=None):
     for seed in seeds:
         generator = torch.Generator(device=pipe.device).manual_seed(seed)
         result = pipe(
-            prompt,
+            prompt=prompt,
             generator=generator,
             num_inference_steps=args.total_timesteps,
             guidance_scale=args.guidance_scale,
@@ -54,7 +57,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--save_root', type=str, default='')
-    parser.add_argument('--sd_ckpt', type=str, default="black-forest-labs/FLUX.1-dev")
+    parser.add_argument('--sd_ckpt', type=str, default="black-forest-labs/FLUX.2-klein-4B")
     parser.add_argument('--model_id', type=str, default=None)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--device', type=str, default='cuda:0')
@@ -67,7 +70,7 @@ def main():
     parser.add_argument('--prompts', type=str, default=None)
     parser.add_argument('--height', type=int, default=512)
     parser.add_argument('--width', type=int, default=512)
-    parser.add_argument('--max_sequence_length', type=int, default=512)
+    parser.add_argument('--max_sequence_length', type=int, default=DEFAULT_MAX_SEQUENCE_LENGTH)
     parser.add_argument('--erase_type', type=str, default='', help='instance, style, celebrity')
     parser.add_argument('--target_concept', type=str, default='')
     parser.add_argument('--contents', type=str, default='')
@@ -82,16 +85,7 @@ def main():
         'float32': torch.float32,
     }
 
-    concept_list, concept_list_tmp = [], [item.strip() for item in args.contents.split(',') if item.strip()]
-    if 'edit' in mode_list:
-        prompt_templates = template_dict[args.erase_type] if args.prompts is None else args.prompts.split(';')
-        for concept in concept_list_tmp:
-            check_path = os.path.join(args.save_root, args.target_concept.replace(', ', '_'), concept, 'edit')
-            os.makedirs(check_path, exist_ok=True)
-            if len(os.listdir(check_path)) != len(prompt_templates) * args.num_samples:
-                concept_list.append(concept)
-    else:
-        concept_list = concept_list_tmp
+    concept_list = [item.strip() for item in args.contents.split(',') if item.strip()]
     if len(concept_list) == 0:
         return
 
@@ -99,13 +93,31 @@ def main():
     pipe_edit = None
     if 'edit' in mode_list:
         pipe_edit = copy.deepcopy(pipe) if 'original' in mode_list else pipe
-        edit_path = args.edit_ckpt or os.path.join("logs/checkpoints", sorted(os.listdir("logs/checkpoints"))[-1])
+        if args.edit_ckpt is None:
+            raise ValueError("--edit_ckpt is required when --mode includes edit")
+        edit_path = args.edit_ckpt
         edit_state_dict = load_file(edit_path, device='cpu')
+        print(f"Loading edited transformer weights from {edit_path}")
+        print(f"Edited checkpoint keys: {len(edit_state_dict)}")
         transformer_state = pipe_edit.transformer.state_dict()
+        max_pre_load_diff = 0.0
+        max_post_load_diff = 0.0
         for key, value in edit_state_dict.items():
-            expected = transformer_state[key]
-            expected.copy_(value.to(device=expected.device, dtype=expected.dtype))
-        print(f"Loaded {len(edit_state_dict)} edited FLUX transformer weights.")
+            state_key = key[len("transformer."):] if key.startswith("transformer.") else key
+            if state_key not in transformer_state:
+                raise KeyError(f"Edited weight '{key}' is not in the FLUX transformer state dict")
+            expected = transformer_state[state_key]
+            loaded_value = value.to(device=expected.device, dtype=expected.dtype)
+            pre_load_diff = (expected.float() - loaded_value.float()).norm()
+            expected.copy_(loaded_value)
+            post_load_diff = (expected.float() - loaded_value.float()).norm()
+            max_pre_load_diff = max(max_pre_load_diff, pre_load_diff.item())
+            max_post_load_diff = max(max_post_load_diff, post_load_diff.item())
+        print(
+            f"Loaded {len(edit_state_dict)} edited transformer weights | "
+            f"max_pre_load_diff={max_pre_load_diff:.6f} | "
+            f"max_post_load_diff={max_post_load_diff:.6f}"
+        )
 
     seed_everything(args.seed, True)
     if args.prompts is None:

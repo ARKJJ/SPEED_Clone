@@ -28,12 +28,19 @@ def seed_everything(seed, deterministic=False):
         torch.backends.cudnn.benchmark = False
 
 
+def load_flux_pipeline(model_id, device, torch_dtype):
+    pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
+    return pipe
+
+
 def flux_generate(pipe, prompts, seeds, args, desc=None):
     images = []
     for prompt, seed in zip(prompts, seeds):
         generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
         image = pipe(
-            prompt,
+            prompt=prompt,
             generator=generator,
             num_inference_steps=args.total_timesteps,
             guidance_scale=args.guidance_scale,
@@ -52,7 +59,7 @@ def main():
     parser = argparse.ArgumentParser()
     # Base Config
     parser.add_argument("--save_root", type=str, default="")
-    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.1-dev")
+    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.2-klein-4B")
     parser.add_argument("--model_id", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -89,15 +96,8 @@ def main():
 
     seed_everything(args.seed, True)
 
-    # region [Prepare Models]
     model_id = args.model_id or args.sd_ckpt
-    pipe = DiffusionPipeline.from_pretrained(
-        model_id,
-        safety_checker=None,
-        torch_dtype=dtype_map[args.torch_dtype],
-    ).to(args.device)
-    pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
+    pipe = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
 
     if "edit" in mode_list:
         pipe_edit = copy.deepcopy(pipe) if "original" in mode_list else pipe
@@ -105,17 +105,28 @@ def main():
             raise ValueError("--edit_ckpt is required when --mode includes edit")
         edit_state_dict = load_file(args.edit_ckpt, device="cpu")
         transformer_state = pipe_edit.transformer.state_dict()
+        print(f"Loading edited transformer weights from {args.edit_ckpt}")
+        print(f"Edited checkpoint keys: {len(edit_state_dict)}")
+        max_pre_load_diff = 0.0
+        max_post_load_diff = 0.0
         for key, value in edit_state_dict.items():
             state_key = key[len("transformer."):] if key.startswith("transformer.") else key
             if state_key not in transformer_state:
                 raise KeyError(f"Edited weight '{key}' is not in the FLUX transformer state dict")
             expected = transformer_state[state_key]
-            expected.copy_(value.to(device=expected.device, dtype=expected.dtype))
-        print(f"Loaded {len(edit_state_dict)} edited FLUX transformer weights.")
+            loaded_value = value.to(device=expected.device, dtype=expected.dtype)
+            pre_load_diff = (expected.float() - loaded_value.float()).norm()
+            expected.copy_(loaded_value)
+            post_load_diff = (expected.float() - loaded_value.float()).norm()
+            max_pre_load_diff = max(max_pre_load_diff, pre_load_diff.item())
+            max_post_load_diff = max(max_post_load_diff, post_load_diff.item())
+        print(
+            f"Loaded {len(edit_state_dict)} edited FLUX transformer weights | "
+            f"max_pre_load_diff={max_pre_load_diff:.6f} | "
+            f"max_post_load_diff={max_post_load_diff:.6f}"
+        )
     else:
         pipe_edit = None
-    # endregion
-
     def combine_images_horizontally(images):
         widths, heights = zip(*(img.size for img in images))
         new_img = Image.new("RGB", (sum(widths), max(heights)))

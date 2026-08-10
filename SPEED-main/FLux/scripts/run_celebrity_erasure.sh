@@ -5,14 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.1-dev}"
+SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.2-klein-4B}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-FLux/logs/checkpoints}"
 SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-FLux/logs/FLUX}"
 PARAMS="${PARAMS:-V}"
-RESIDUAL_SCALE="${RESIDUAL_SCALE:-4}"
 TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-20}"
 THRESHOLD="${THRESHOLD:-1e-4}"
 UPDATE_LAMBDA="${UPDATE_LAMBDA:-1e-2}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 CONTENTS="${CONTENTS:-erase, retain}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-20}"
@@ -27,7 +27,7 @@ mkdir -p "${CHECKPOINT_DIR}" "${SAVE_ROOT_BASE}"
 
 read_targets_from_csv() {
   local dataset_path="$1"
-  python - "${dataset_path}" <<'PY'
+  "${PYTHON_BIN}" - "${dataset_path}" <<'PY'
 import sys
 import pandas as pd
 
@@ -46,13 +46,13 @@ run_task() {
   local target_concepts
   target_concepts="$(read_targets_from_csv "${dataset_path}")"
 
-  local run_name="erase_${erase_type}_to_person_${PARAMS}_r${RESIDUAL_SCALE}_t${TRACE_NUM_STEPS}"
+  local run_name="erase_${erase_type}_to_person_${PARAMS}_fixed_t${TRACE_NUM_STEPS}"
   local ckpt_path="${CHECKPOINT_DIR}/${run_name}.safetensors"
-  local save_root="${SAVE_ROOT_BASE}/${erase_type}_${PARAMS}_r${RESIDUAL_SCALE}_t${TRACE_NUM_STEPS}"
+  local save_root="${SAVE_ROOT_BASE}/${erase_type}_${PARAMS}"
   local target_root="${save_root}/${erase_type}"
 
   echo "========== [${erase_type}] Editing on GPU ${gpu_id} =========="
-  CUDA_VISIBLE_DEVICES="${gpu_id}" python FLux/CE_Flux.py \
+  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/CE_Flux.py \
     --sd_ckpt "${SD_CKPT}" \
     --device "cuda:0" \
     --target_concepts "${target_concepts}" \
@@ -63,13 +63,12 @@ run_task() {
     --file_name "${run_name}" \
     --params "${PARAMS}" \
     --trace_num_steps "${TRACE_NUM_STEPS}" \
-    --residual_scale "${RESIDUAL_SCALE}" \
     --threshold "${THRESHOLD}" \
     --update_lambda "${UPDATE_LAMBDA}"
 
   echo "========== [${erase_type}] Sampling original/edit/combine on GPU ${gpu_id} =========="
   local sample_args=(
-    python FLux/sample2.py
+    "${PYTHON_BIN}" FLux/sample2.py
     --sd_ckpt "${SD_CKPT}"
     --device "cuda:0"
     --mode "original,edit"
@@ -99,10 +98,10 @@ run_task() {
 
   if [[ -n "${GCD_SCRIPT}" ]]; then
     mkdir -p "${target_root}/metrics"
-    CUDA_VISIBLE_DEVICES="${gpu_id}" python "${GCD_SCRIPT}" \
+    CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" "${GCD_SCRIPT}" \
       --image_folder "${erase_edit_dir}" \
       > "${target_root}/metrics/gcd_erase.txt"
-    CUDA_VISIBLE_DEVICES="${gpu_id}" python "${GCD_SCRIPT}" \
+    CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" "${GCD_SCRIPT}" \
       --image_folder "${retain_edit_dir}" \
       > "${target_root}/metrics/gcd_retain.txt"
     echo "GCD metrics saved under: ${target_root}/metrics"
