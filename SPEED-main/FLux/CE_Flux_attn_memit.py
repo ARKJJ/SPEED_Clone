@@ -31,14 +31,18 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
         return [0]
 
     input_ids = [int(token_id) for token_id in token_inputs.input_ids[0, :valid_length].tolist()]
-    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-    content_inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
-    content_ids = [int(token_id) for token_id in content_inputs.input_ids[0].tolist() if int(token_id) not in special_ids]
-    if content_ids and len(content_ids) <= len(input_ids):
-        for start in range(len(input_ids) - len(content_ids), -1, -1):
-            if input_ids[start:start + len(content_ids)] == content_ids:
-                return list(range(start, start + len(content_ids)))
+    try:
+        prompt_ids = tokenizer(prompt, add_special_tokens=False, truncation=True, return_tensors="pt").input_ids[0].tolist()
+    except TypeError:
+        prompt_ids = tokenizer(prompt, truncation=True, return_tensors="pt").input_ids[0].tolist()
+    prompt_ids = [int(token_id) for token_id in prompt_ids]
+    if prompt_ids:
+        span_length = len(prompt_ids)
+        for start_idx in range(0, valid_length - span_length + 1):
+            if input_ids[start_idx:start_idx + span_length] == prompt_ids:
+                return list(range(start_idx, start_idx + span_length))
 
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
     content_indices = [
@@ -47,7 +51,7 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
         if int(token_id) not in special_ids and idx < search_end
     ]
     if content_indices:
-        return [content_indices[-1]]
+        return content_indices
     return [valid_length - 1]
 
 
@@ -122,20 +126,26 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
     return traced_concepts
 
 
-def _closed_form_update(target_inputs, anchor_inputs, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
+def _concept_matrices(target_inputs, anchor_inputs):
+    sum_target_target = [target @ target.T for target in target_inputs]
+    sum_target_anchor = [anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]
+    return torch.stack(sum_target_anchor).mean(0), torch.stack(sum_target_target).mean(0)
+
+
+def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
     if retain_inputs is None or retain_inputs.numel() == 0:
-        projector = torch.eye(target_inputs.shape[0], device=target_inputs.device, dtype=target_inputs.dtype)
+        projector = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
     else:
-        retain_inputs = retain_inputs.to(device=target_inputs.device, dtype=target_inputs.dtype)
+        retain_inputs = retain_inputs.to(device=sum_target_target.device, dtype=sum_target_target.dtype)
         covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
         U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
         null_basis = U[:, S < retain_threshold]
         if null_basis.shape[1] == 0:
-            projector = torch.eye(target_inputs.shape[0], device=target_inputs.device, dtype=target_inputs.dtype)
+            projector = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
         else:
             projector = null_basis @ null_basis.T
-    eye = torch.eye(target_inputs.shape[0], device=target_inputs.device, dtype=target_inputs.dtype)
-    delta = weight @ (anchor_inputs - target_inputs) @ target_inputs.T @ projector @ (target_inputs @ target_inputs.T @ projector + update_lambda * eye).inverse()
+    eye = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
+    delta = weight @ (sum_target_anchor - sum_target_target) @ projector @ (sum_target_target @ projector + update_lambda * eye).inverse()
     return delta
 
 
@@ -242,17 +252,17 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 target_inputs.append(concept_trace[module_name]["inputs"])
                 anchor_inputs.append(concept_trace[module_name]["inputs"] + (anchor - final_current) * (args.residual_scale / remaining_count))
 
-            target_inputs = torch.cat(target_inputs, dim=1).to(module.weight.device, torch.float32)
-            anchor_inputs = torch.cat(anchor_inputs, dim=1).to(module.weight.device, torch.float32)
+            sum_target_anchor, sum_target_target = _concept_matrices(target_inputs, anchor_inputs)
+            sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
+            sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
             retain_inputs = retain_inputs_by_module[module_name]
 
-            lambda_eff = args.update_lambda * target_inputs.shape[1]
             weight_before = module.weight.float()
             delta = _closed_form_update(
-                target_inputs,
-                anchor_inputs,
+                sum_target_anchor,
+                sum_target_target,
                 weight_before,
-                lambda_eff,
+                args.update_lambda,
                 None if retain_inputs is None else retain_inputs.to(module.weight.device, torch.float32),
                 args.threshold,
             )

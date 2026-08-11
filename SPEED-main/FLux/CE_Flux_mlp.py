@@ -4,7 +4,6 @@ import time
 import torch
 import argparse
 import pandas as pd
-from diffusers import DiffusionPipeline
 from safetensors.torch import save_file
 
 try:
@@ -13,23 +12,7 @@ except ImportError:
     Flux2KleinPipeline = None
 
 
-OLD_MLP2_SUFFIX = ".ff_context.net.2"
-FLUX2_MLP2_SUFFIX = ".ff_context.linear_out"
-COMMUNITY_FLUX2_MLP2_SUFFIX = ".txt_mlp.2"
-
-
-def get_token_id(prompt, tokenizer=None, max_sequence_length=None, return_ids_only=True):
-    token_ids = tokenizer(prompt, padding="max_length", max_length=max_sequence_length, truncation=True, return_tensors="pt")
-    return token_ids.input_ids if return_ids_only else token_ids
-
-
-def _find_last_token_subsequence(sequence, subsequence):
-    if not subsequence or len(subsequence) > len(sequence):
-        return None
-    for start in range(len(sequence) - len(subsequence), -1, -1):
-        if sequence[start:start + len(subsequence)] == subsequence:
-            return start + len(subsequence) - 1
-    return None
+FLUX2_MLP_SUFFIX = ".ff_context.linear_out"
 
 
 def _apply_flux2_chat_template(prompt, tokenizer):
@@ -56,90 +39,59 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
         return [0]
 
     text = _apply_flux2_chat_template(prompt, tokenizer)
-    token_inputs = get_token_id(text, tokenizer, max_sequence_length, return_ids_only=False)
+    token_inputs = tokenizer(
+        text,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        return_tensors="pt",
+    )
     valid_length = int(token_inputs.attention_mask[0].sum().item())
     if valid_length <= 0:
         return [0]
 
     input_ids = [int(token_id) for token_id in token_inputs.input_ids[0, :valid_length].tolist()]
-    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-    content_inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
-    content_ids = [int(token_id) for token_id in content_inputs.input_ids[0].tolist() if int(token_id) not in special_ids]
-    selected = _find_last_token_subsequence(input_ids, content_ids)
-    if selected is not None:
-        start = selected - len(content_ids) + 1
-        return list(range(start, selected + 1))
+    try:
+        prompt_ids = tokenizer(prompt, add_special_tokens=False, truncation=True, return_tensors="pt").input_ids[0].tolist()
+    except TypeError:
+        prompt_ids = tokenizer(prompt, truncation=True, return_tensors="pt").input_ids[0].tolist()
+    prompt_ids = [int(token_id) for token_id in prompt_ids]
+    if prompt_ids:
+        span_length = len(prompt_ids)
+        for start_idx in range(0, valid_length - span_length + 1):
+            if input_ids[start_idx:start_idx + span_length] == prompt_ids:
+                return list(range(start_idx, start_idx + span_length))
 
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
     content_indices = [idx for idx, token_id in enumerate(input_ids) if int(token_id) not in special_ids and idx < search_end]
     if content_indices:
-        return [content_indices[-1]]
+        return content_indices
     return [valid_length - 1]
 
 
-def _normalize_token_spec(token_spec):
-    if isinstance(token_spec, dict):
-        return list(token_spec["indices"]), bool(token_spec.get("pool", False))
-    return list(token_spec), False
-
-
 def _load_flux_pipeline(model_id, device, torch_dtype):
-    model_id_lower = model_id.lower()
-    if "flux.2-klein" in model_id_lower:
-        if Flux2KleinPipeline is None:
-            raise RuntimeError(
-                "Flux2KleinPipeline is unavailable in this diffusers install. "
-                "Upgrade diffusers to a version that includes FLUX.2 support."
-            )
-        pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
-    else:
-        pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)
+    if Flux2KleinPipeline is None:
+        raise RuntimeError("Flux2KleinPipeline is unavailable in this diffusers install")
+    pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
     return pipe
 
 
-def _resolve_mlp_spec(transformer):
-    module_names = list(dict(transformer.named_modules()).keys())
-    if any(name.endswith(FLUX2_MLP2_SUFFIX) for name in module_names):
-        return {
-            "suffix": FLUX2_MLP2_SUFFIX,
-            "layer_pattern": r"transformer_blocks\.(\d+)\.",
-            "label": "FLUX.2 text MLP output",
-        }
-    if any(name.endswith(OLD_MLP2_SUFFIX) for name in module_names):
-        return {
-            "suffix": OLD_MLP2_SUFFIX,
-            "layer_pattern": r"transformer_blocks\.(\d+)\.",
-            "label": "FLUX text-side MLP2",
-        }
-    if any(name.endswith(COMMUNITY_FLUX2_MLP2_SUFFIX) for name in module_names):
-        return {
-            "suffix": COMMUNITY_FLUX2_MLP2_SUFFIX,
-            "layer_pattern": r"double_blocks\.(\d+)\.",
-            "label": "community FLUX.2 text MLP",
-        }
-    raise RuntimeError(
-        "No recognized FLUX text MLP modules found. "
-        "Expected one of 'transformer_blocks.*.ff_context.linear_out', "
-        "'transformer_blocks.*.ff_context.net.2', or 'double_blocks.*.txt_mlp.2'."
-    )
-
-
 def _select_text_mlp_modules(transformer, device, args):
-    spec = _resolve_mlp_spec(transformer)
     selected = []
     layer_start = int(getattr(args, "layer_start", 0))
     layer_end = getattr(args, "layer_end", None)
     layer_stride = max(1, int(getattr(args, "layer_stride", 1)))
     if layer_end is not None:
         layer_end = int(layer_end)
-    layer_pattern = re.compile(spec["layer_pattern"])
+    layer_pattern = re.compile(r"transformer_blocks\.(\d+)\.")
     for name, module in transformer.named_modules():
         if not hasattr(module, "weight") or module.weight is None:
             continue
-        if not name.endswith(spec["suffix"]):
+        if not name.endswith(FLUX2_MLP_SUFFIX):
             continue
         match = layer_pattern.match(name)
         if match is None:
@@ -152,13 +104,15 @@ def _select_text_mlp_modules(transformer, device, args):
         if (layer_index - layer_start) % layer_stride != 0:
             continue
         selected.append((name, module.to(device)))
-    return selected, spec
+    if not selected:
+        raise RuntimeError("No Flux2 text MLP modules found: expected transformer_blocks.*.ff_context.linear_out")
+    return selected
 
 
 def _group_mlp_modules_by_layer(edit_modules):
     grouped = {}
     for module_name, module in edit_modules:
-        match = re.match(r"(?:transformer_blocks|double_blocks)\.(\d+)\.", module_name)
+        match = re.match(r"transformer_blocks\.(\d+)\.", module_name)
         if match is None:
             continue
         grouped.setdefault(int(match.group(1)), []).append((module_name, module))
@@ -175,7 +129,8 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
         token_spec = token_indices.get(concept)
         if not token_spec:
             continue
-        selected_token_indices, pool_selected_tokens = _normalize_token_spec(token_spec)
+        selected_token_indices = list(token_spec["indices"])
+        pool_selected_tokens = bool(token_spec.get("pool", False))
         if not selected_token_indices:
             continue
         grouped_concepts.setdefault((tuple(selected_token_indices), pool_selected_tokens), []).append(concept)
@@ -203,7 +158,7 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
             ]
             with torch.no_grad():
                 pipeline(
-                    concept_batch,
+                    prompt=concept_batch,
                     generator=generators,
                     num_inference_steps=args.trace_num_steps,
                     guidance_scale=3.5,
@@ -226,28 +181,34 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
     return traced_concepts
 
 
-def _closed_form_update(target_inputs, anchor_inputs, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
-    retain_inputs = retain_inputs.to(device=target_inputs.device, dtype=target_inputs.dtype)
+def _concept_matrices(target_inputs, anchor_inputs):
+    sum_target_target = [target @ target.T for target in target_inputs]
+    sum_target_anchor = [anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]
+    return torch.stack(sum_target_anchor).mean(0), torch.stack(sum_target_target).mean(0)
+
+
+def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
+    retain_inputs = retain_inputs.to(device=sum_target_target.device, dtype=sum_target_target.dtype)
     covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
     U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
     null_basis = U[:, S < retain_threshold]
     if null_basis.shape[1] == 0:
-        projector = torch.eye(target_inputs.shape[0], device=target_inputs.device, dtype=target_inputs.dtype)
+        projector = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
     else:
         projector = null_basis @ null_basis.T
-    eye = torch.eye(target_inputs.shape[0], device=target_inputs.device, dtype=target_inputs.dtype)
-    delta = weight @ (anchor_inputs - target_inputs) @ target_inputs.T @ projector @ (target_inputs @ target_inputs.T @ projector + update_lambda * eye).inverse()
+    eye = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
+    system = sum_target_target @ projector + update_lambda * eye
+    residual_projection = weight @ (sum_target_anchor - sum_target_target) @ projector
+    delta = torch.linalg.solve(system.T, residual_projection.T).T
     return delta
 
 
 def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512,):
-    edit_modules, mlp_spec = _select_text_mlp_modules(
+    edit_modules = _select_text_mlp_modules(
         pipeline.transformer,
         device,
         args,
     )
-    if not edit_modules:
-        raise RuntimeError(f"No text-side MLP modules selected for {mlp_spec['label']}")
     module_names = [name for name, _ in edit_modules]
     grouped_modules = _group_mlp_modules_by_layer(edit_modules)
 
@@ -262,10 +223,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             "indices": _subject_token_indices(anchor_concept, pipeline.tokenizer, max_sequence_length),
             "pool": True,
         }
-    print(f"\nSelected {mlp_spec['label']} modules:")
-    for name in module_names:
-        print(f"  {name}")
-
     retain_token_indices = {}
     for concept in retain_texts:
         if concept == "":
@@ -298,7 +255,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         retain_inputs_by_module[module_name] = torch.cat(retain_inputs_by_module[module_name], dim=1)
 
     edit_dict = {}
-    for layer_index, layer_modules in grouped_modules:
+    for _, layer_modules in grouped_modules:
         layer_module_names = [module_name for module_name, _module in layer_modules]
         layer_target_traces = _trace_concepts(pipeline, target_concepts, target_token_indices, layer_module_names, args, device, max_sequence_length)
         layer_anchor_traces = _trace_concepts(pipeline, anchor_concepts, anchor_token_indices, layer_module_names, args, device, max_sequence_length)
@@ -309,42 +266,23 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 target_inputs.append(concept_trace[module_name]["inputs"])
                 anchor_inputs.append(layer_anchor_traces[anchor_concept][module_name]["inputs"])
 
-            target_inputs = torch.cat(target_inputs, dim=1).to(module.weight.device, torch.float32)
-            anchor_inputs = torch.cat(anchor_inputs, dim=1).to(module.weight.device, torch.float32)
+            sum_target_anchor, sum_target_target = _concept_matrices(target_inputs, anchor_inputs)
+            sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
+            sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
             retain_inputs = retain_inputs_by_module[module_name]
 
-            lambda_eff = args.update_lambda * target_inputs.shape[1]
             weight_before = module.weight.float()
             delta = _closed_form_update(
-                target_inputs,
-                anchor_inputs,
+                sum_target_anchor,
+                sum_target_target,
                 weight_before,
-                lambda_eff,
+                args.update_lambda,
                 retain_inputs.to(module.weight.device, torch.float32),
                 args.threshold,
             )
-            weight_norm = weight_before.norm()
-            delta_norm = delta.norm()
-            input_diff_norm = (target_inputs - anchor_inputs).norm()
-            anchor_projected = weight_before @ anchor_inputs
             module.weight = torch.nn.Parameter(weight_before.add(delta).to(module.weight.dtype))
-            target_projected_after = module.weight.float() @ target_inputs
-            fit_gap_norm = (target_projected_after - anchor_projected).norm()
             edit_dict[module_name + ".weight"] = module.weight.detach().clone()
-            print(
-                f"  Updated layer={layer_index} {module_name} | "
-                f"samples={target_inputs.shape[1]} | "
-                f"retain_samples={retain_inputs.shape[1]} | "
-                f"lambda_eff={lambda_eff:.6f} | "
-                f"||delta||={delta_norm.item():.4f} | "
-                f"||W||={weight_norm.item():.4f} | "
-                f"rel={(delta_norm / (weight_norm + 1e-12)).item():.6f} | "
-                f"input_diff_norm={input_diff_norm.item():.4f} | "
-                f"fit_gap_norm={fit_gap_norm.item():.4f} | "
-                f"fit_rel={(fit_gap_norm / (anchor_projected.norm() + 1e-12)).item():.6f}"
-            )
 
-    print(f"Current model status: Edited {target_concepts} into {anchor_concepts or ['null-anchor']}")
     return edit_dict
 
 
@@ -353,7 +291,6 @@ if __name__ == "__main__":
     parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.2-klein-4B")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--file_name", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--target_concepts", type=str, required=True)
     parser.add_argument("--anchor_concepts", type=str, required=True)

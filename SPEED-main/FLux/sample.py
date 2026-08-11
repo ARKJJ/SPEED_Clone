@@ -11,6 +11,7 @@ import random
 import torch
 import numpy as np
 from diffusers import DiffusionPipeline  
+from diffusers.utils import logging as diffusers_logging
 from safetensors.torch import load_file  
 from template import template_dict  
 
@@ -89,7 +90,30 @@ def main():
     if len(concept_list) == 0:
         return
 
+    if 'edit' in mode_list:
+        sampled_concepts = []
+        for concept in concept_list:
+            check_path = os.path.join(
+                args.save_root,
+                args.target_concept.replace(', ', '_'),
+                concept,
+                'edit',
+            )
+            os.makedirs(check_path, exist_ok=True)
+            if len(os.listdir(check_path)) != len(template_dict[args.erase_type]) * 10:
+                sampled_concepts.append(concept)
+        concept_list = sampled_concepts
+        if len(concept_list) == 0:
+            return
+
+    diffusers_logging.set_verbosity_error()
+    diffusers_logging.enable_progress_bar()
+
     pipe = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
+    try:
+        pipe.set_progress_bar_config(disable=False)
+    except AttributeError:
+        pass
     pipe_edit = None
     if 'edit' in mode_list:
         pipe_edit = copy.deepcopy(pipe) if 'original' in mode_list else pipe
@@ -131,21 +155,24 @@ def main():
         seeds = [args.seed + sample_idx for sample_idx in range(start_idx, end_idx)]
         for concept, prompts in zip(concept_list, prompt_list):
             for count, prompt in enumerate(prompts):
-
                 save_images = {}
 
                 if 'original' in mode_list:
-                    save_images['original'] = flux_generate(pipe=pipe,
-                                                   prompt=prompt,
-                                                   seeds=seeds,
-                                                   args=args,
-                                                   desc=f"{count} x {prompt} | original")
+                    save_images['original'] = flux_generate(
+                        pipe=pipe,
+                        prompt=prompt,
+                        seeds=seeds,
+                        args=args,
+                        desc=f"{count} x {prompt} | original",
+                    )
                 if 'edit' in mode_list:
-                    save_images['edit'] = flux_generate(pipe=pipe_edit,
-                                               prompt=prompt,
-                                               seeds=seeds,
-                                               args=args,
-                                               desc=f"{count} x {prompt} | edit")
+                    save_images['edit'] = flux_generate(
+                        pipe=pipe_edit,
+                        prompt=prompt,
+                        seeds=seeds,
+                        args=args,
+                        desc=f"{count} x {prompt} | edit",
+                    )
 
                 save_path = os.path.join(args.save_root, args.target_concept.replace(', ', '_'), concept)
                 for mode in mode_list:

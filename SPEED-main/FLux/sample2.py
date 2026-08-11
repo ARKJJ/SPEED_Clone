@@ -10,6 +10,7 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset, DataLoader
 from diffusers import DiffusionPipeline
+from diffusers.utils import logging as diffusers_logging
 from safetensors.torch import load_file
 
 from template import template_dict
@@ -32,6 +33,10 @@ def load_flux_pipeline(model_id, device, torch_dtype):
     pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
+    try:
+        pipe.set_progress_bar_config(disable=False)
+    except AttributeError:
+        pass
     return pipe
 
 
@@ -86,6 +91,9 @@ def main():
     parser.add_argument("--max_num", type=int, default=None)
     args = parser.parse_args()
 
+    diffusers_logging.set_verbosity_error()
+    diffusers_logging.enable_progress_bar()
+
     bs = args.batch_size
     mode_list = args.mode.replace(" ", "").split(",")
     dtype_map = {
@@ -97,6 +105,23 @@ def main():
     seed_everything(args.seed, True)
 
     model_id = args.model_id or args.sd_ckpt
+    contents = [x.strip() for x in args.contents.split(",") if x.strip()]
+    if "edit" in mode_list:
+        sampled_contents = []
+        for content in contents:
+            check_path = os.path.join(
+                args.save_root,
+                args.target_concept.replace(", ", "_"),
+                content,
+                "edit",
+            )
+            os.makedirs(check_path, exist_ok=True)
+            if len(os.listdir(check_path)) != len(template_dict[args.erase_type]) * 10:
+                sampled_contents.append(content)
+        contents = sampled_contents
+        if not contents:
+            return
+
     pipe = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
 
     if "edit" in mode_list:
@@ -134,7 +159,7 @@ def main():
             new_img.paste(img, (sum(widths[:i]), 0))
         return new_img
 
-    for content in [x.strip() for x in args.contents.split(",") if x.strip()]:
+    for content in contents:
         dataset = AdaDataset(content=content, args=args)
         dataloader = DataLoader(dataset, batch_size=bs, drop_last=False)
 
