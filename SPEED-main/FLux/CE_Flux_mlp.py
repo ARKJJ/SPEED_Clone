@@ -80,13 +80,8 @@ def _load_flux_pipeline(model_id, device, torch_dtype):
     return pipe
 
 
-def _select_text_mlp_modules(transformer, device, args):
+def _select_text_mlp_modules(transformer, device):
     selected = []
-    layer_start = int(getattr(args, "layer_start", 0))
-    layer_end = getattr(args, "layer_end", None)
-    layer_stride = max(1, int(getattr(args, "layer_stride", 1)))
-    if layer_end is not None:
-        layer_end = int(layer_end)
     layer_pattern = re.compile(r"transformer_blocks\.(\d+)\.")
     for name, module in transformer.named_modules():
         if not hasattr(module, "weight") or module.weight is None:
@@ -95,13 +90,6 @@ def _select_text_mlp_modules(transformer, device, args):
             continue
         match = layer_pattern.match(name)
         if match is None:
-            continue
-        layer_index = int(match.group(1))
-        if layer_index < layer_start:
-            continue
-        if layer_end is not None and layer_index > layer_end:
-            continue
-        if (layer_index - layer_start) % layer_stride != 0:
             continue
         selected.append((name, module.to(device)))
     if not selected:
@@ -207,7 +195,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     edit_modules = _select_text_mlp_modules(
         pipeline.transformer,
         device,
-        args,
     )
     module_names = [name for name, _ in edit_modules]
     grouped_modules = _group_mlp_modules_by_layer(edit_modules)
@@ -236,6 +223,16 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 "pool": True,
             }
 
+    anchor_base_traces = _trace_concepts(
+        pipeline,
+        anchor_concepts,
+        anchor_token_indices,
+        module_names,
+        args,
+        device,
+        max_sequence_length,
+    )
+
     retain_inputs_by_module = {module_name: [] for module_name in module_names}
     for j in range(0, len(retain_texts), args.chunk_size):
         retain_chunk = retain_texts[j:j + args.chunk_size]
@@ -258,13 +255,12 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     for _, layer_modules in grouped_modules:
         layer_module_names = [module_name for module_name, _module in layer_modules]
         layer_target_traces = _trace_concepts(pipeline, target_concepts, target_token_indices, layer_module_names, args, device, max_sequence_length)
-        layer_anchor_traces = _trace_concepts(pipeline, anchor_concepts, anchor_token_indices, layer_module_names, args, device, max_sequence_length)
         for module_name, module in layer_modules:
             target_inputs, anchor_inputs = [], []
             for concept, anchor_concept in zip(target_concepts, anchor_concepts):
                 concept_trace = layer_target_traces[concept]
                 target_inputs.append(concept_trace[module_name]["inputs"])
-                anchor_inputs.append(layer_anchor_traces[anchor_concept][module_name]["inputs"])
+                anchor_inputs.append(anchor_base_traces[anchor_concept][module_name]["inputs"])
 
             sum_target_anchor, sum_target_target = _concept_matrices(target_inputs, anchor_inputs)
             sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
@@ -298,9 +294,6 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=str, default=None)
     parser.add_argument("--chunk_size", type=int, default=128)
     parser.add_argument("--trace_batch_size", type=int, default=4)
-    parser.add_argument("--layer_start", type=int, default=0)
-    parser.add_argument("--layer_end", type=int, default=None)
-    parser.add_argument("--layer_stride", type=int, default=1)
     parser.add_argument("--threshold", type=float, default=3e-2)
     parser.add_argument("--trace_num_steps", type=int, default=20)
     parser.add_argument("--trace_seed", type=int, default=0)

@@ -232,15 +232,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             device,
             max_sequence_length,
         )
-        layer_anchor_traces = _trace_concepts(
-            pipeline,
-            anchor_concepts,
-            anchor_token_indices,
-            trace_module_names,
-            args,
-            device,
-            max_sequence_length,
-        )
         for module_name, module, suffix in layer_modules:
             final_module_name = final_modules[suffix]
             remaining_count = remaining_counts_by_module[module_name]
@@ -248,7 +239,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             for concept, anchor_concept in zip(target_concepts, anchor_concepts):
                 concept_trace = layer_target_traces[concept]
                 final_current = concept_trace[final_module_name]["outputs"]
-                anchor = layer_anchor_traces[anchor_concept][final_module_name]["outputs"].to(final_current.device, final_current.dtype)
+                anchor = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(final_current.device, final_current.dtype)
                 target_inputs.append(concept_trace[module_name]["inputs"])
                 anchor_inputs.append(concept_trace[module_name]["inputs"] + (anchor - final_current) * (args.residual_scale / remaining_count))
 
