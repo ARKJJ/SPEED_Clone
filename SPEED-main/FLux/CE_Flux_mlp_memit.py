@@ -1,33 +1,37 @@
 import os, re
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import time
 import torch
 import argparse
 import pandas as pd
 from safetensors.torch import save_file
+from diffusers import Flux2KleinPipeline
 
-try:
-    from diffusers import Flux2KleinPipeline
-except ImportError:
-    Flux2KleinPipeline = None
+FLUX2_MLP_SUFFIX = ".ff_context.linear_out"
 
 
-MLP_SUFFIX = ".ff_context.linear_out"
-
-
-def _apply_chat_template(prompt, tokenizer):
+def _apply_flux2_chat_template(prompt, tokenizer):
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return prompt
     messages = [{"role": "user", "content": prompt}]
     try:
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
     except TypeError:
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
 
 def _subject_token_indices(prompt, tokenizer, max_sequence_length):
-    if prompt == "":
-        return [0]
     token_inputs = tokenizer(
-        _apply_chat_template(prompt, tokenizer),
+        _apply_flux2_chat_template(prompt, tokenizer),
         padding="max_length",
         max_length=max_sequence_length,
         truncation=True,
@@ -44,28 +48,28 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
     prompt_ids = [int(token_id) for token_id in prompt_ids]
     for start_idx in range(valid_length - len(prompt_ids) + 1):
         if prompt_ids and input_ids[start_idx:start_idx + len(prompt_ids)] == prompt_ids:
-            return list(range(start_idx, start_idx + len(prompt_ids)))
+            return [start_idx + len(prompt_ids) - 1]
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
     content_indices = [idx for idx, token_id in enumerate(input_ids) if token_id not in special_ids and idx < search_end]
-    return content_indices or [valid_length - 1]
+    return [content_indices[-1]] if content_indices else [valid_length - 1]
 
 
 def _load_pipeline(model_id, device):
     if Flux2KleinPipeline is None:
         raise RuntimeError("Flux2KleinPipeline is unavailable in this diffusers install")
-    pipeline = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device)
-    pipeline.vae.enable_slicing()
-    pipeline.vae.enable_tiling()
-    return pipeline
+    pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(device)
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
+    return pipe
 
 
 def _select_modules(transformer, device):
     selected = []
     for name, module in transformer.named_modules():
         match = re.match(r"transformer_blocks\.(\d+)\.", name)
-        if match is None or not name.endswith(MLP_SUFFIX) or not hasattr(module, "weight") or module.weight is None:
+        if match is None or not name.endswith(FLUX2_MLP_SUFFIX) or not hasattr(module, "weight") or module.weight is None:
             continue
         selected.append((name, module.to(device)))
     if not selected:
@@ -109,7 +113,7 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
                     prompt=concept_batch,
                     generator=generators,
                     num_inference_steps=args.trace_num_steps,
-                    guidance_scale=args.guidance_scale,
+                    guidance_scale=3.5,
                     height=args.trace_resolution,
                     width=args.trace_resolution,
                     max_sequence_length=max_sequence_length,
@@ -211,32 +215,43 @@ if __name__ == "__main__":
     parser.add_argument("--trace_num_steps", type=int, default=20)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
-    parser.add_argument("--guidance_scale", type=float, default=1.0)
-    parser.add_argument("--update_lambda", type=float, default=1.0)
+    parser.add_argument("--update_lambda", type=float, default=1)
     args = parser.parse_args()
 
-    target_concepts = [concept.strip() for concept in args.target_concepts.split(",")]
-    anchor_concepts = [concept.strip() for concept in args.anchor_concepts.split(",")]
-    if not target_concepts or any(not concept for concept in target_concepts):
+    target_concepts = [con.strip() for con in args.target_concepts.split(",")]
+    if not target_concepts or any(concept == "" for concept in target_concepts):
         raise ValueError("--target_concepts must not contain empty concepts")
+    anchor_concepts = args.anchor_concepts
+    retain_path = args.retain_path
+
+    file_suffix = "_".join(target_concepts[:5]) + f"_{len(target_concepts)}-mlp-memit"
+    anchor_concepts = [x.strip() for x in anchor_concepts.split(",")]
     if len(anchor_concepts) == 1:
-        anchor_concepts *= len(target_concepts)
-    if len(anchor_concepts) != len(target_concepts):
-        raise ValueError("--anchor_concepts must contain one anchor or one per target")
-    retain_texts = [""]
-    if args.retain_path:
-        if args.heads is None:
-            raise ValueError("--heads is required when --retain_path is provided")
-        retain_texts = []
-        frame = pd.read_csv(args.retain_path)
-        for head in args.heads.split(","):
-            retain_texts.extend(frame[head.strip()].dropna().unique().tolist())
-    excluded = target_concepts + [concept for concept in anchor_concepts if concept]
-    retain_texts = [text for text in retain_texts if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", str(text).lower()) for concept in excluded)]
+        anchor_concepts = anchor_concepts * len(target_concepts)
+        if anchor_concepts[0] == "":
+            file_suffix += "-to_null"
+        else:
+            file_suffix += f"-to_{anchor_concepts[0]}"
+    else:
+        assert len(target_concepts) == len(anchor_concepts)
+        file_suffix += f'-to_{anchor_concepts[0]}_etc'
+
+    retain_texts = []
+    if retain_path is not None:
+        assert retain_path.endswith('.csv')
+        df = pd.read_csv(retain_path)
+        for head in args.heads.split(','):
+            retain_texts += df[head.strip()].unique().tolist()
+    else:
+        retain_texts.append("")
+    retain_texts = [
+        text for text in retain_texts
+        if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", text.lower()) for concept in target_concepts)
+    ]
 
     pipeline = _load_pipeline(args.sd_ckpt, args.device)
     edit_dict = edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, args.device)
     save_path = args.save_path or "logs/checkpoints"
-    file_name = args.file_name or f"{time.strftime('%Y%m%d-%H%M%S')}-{'_'.join(target_concepts[:5])}_{len(target_concepts)}-mlp-memit"
+    file_name = args.file_name or f"{time.strftime('%Y%m%d-%H%M%S')}-{file_suffix}"
     os.makedirs(save_path, exist_ok=True)
     save_file(edit_dict, os.path.join(save_path, f"{file_name}.safetensors"))

@@ -5,12 +5,7 @@ import torch
 import argparse
 import pandas as pd
 from safetensors.torch import save_file
-
-try:
-    from diffusers import Flux2KleinPipeline
-except ImportError:
-    Flux2KleinPipeline = None
-
+from diffusers import Flux2KleinPipeline
 
 FLUX2_MLP_SUFFIX = ".ff_context.linear_out"
 
@@ -35,9 +30,6 @@ def _apply_flux2_chat_template(prompt, tokenizer):
 
 
 def _subject_token_indices(prompt, tokenizer, max_sequence_length):
-    if prompt == "":
-        return [0]
-
     text = _apply_flux2_chat_template(prompt, tokenizer)
     token_inputs = tokenizer(
         text,
@@ -60,14 +52,14 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
         span_length = len(prompt_ids)
         for start_idx in range(0, valid_length - span_length + 1):
             if input_ids[start_idx:start_idx + span_length] == prompt_ids:
-                return list(range(start_idx, start_idx + span_length))
+                return [start_idx + span_length - 1]
 
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
     content_indices = [idx for idx, token_id in enumerate(input_ids) if int(token_id) not in special_ids and idx < search_end]
     if content_indices:
-        return content_indices
+        return [content_indices[-1]]
     return [valid_length - 1]
 
 

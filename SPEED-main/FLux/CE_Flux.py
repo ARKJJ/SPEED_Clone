@@ -14,15 +14,21 @@ from diffusers import Flux2KleinPipeline
 ATTENTION_SUFFIXES = {"Q": ".attn.add_q_proj", "K": ".attn.add_k_proj", "V": ".attn.add_v_proj"}
 
 
-def _subject_token_indices(prompt, tokenizer, max_sequence_length):
-    if prompt == "":
-        return [0]
-
+def _apply_flux2_chat_template(prompt, tokenizer):
     messages = [{"role": "user", "content": prompt}]
     try:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
     except TypeError:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def _subject_token_indices(prompt, tokenizer, max_sequence_length):
+    text = _apply_flux2_chat_template(prompt, tokenizer)
     token_inputs = tokenizer(text, padding="max_length", max_length=max_sequence_length, truncation=True, return_tensors="pt")
     valid_length = int(token_inputs.attention_mask[0].sum().item())
     if valid_length <= 0:
@@ -38,14 +44,14 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
         span_length = len(prompt_ids)
         for start_idx in range(0, valid_length - span_length + 1):
             if input_ids[start_idx:start_idx + span_length] == prompt_ids:
-                return list(range(start_idx, start_idx + span_length))
+                return [start_idx + span_length - 1]
 
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
     content_indices = [idx for idx, token_id in enumerate(input_ids) if int(token_id) not in special_ids and idx < search_end]
     if content_indices:
-        return content_indices
+        return [content_indices[-1]]
     return [valid_length - 1]
 
 
@@ -169,6 +175,16 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         for concept in retain_texts
     }
 
+    anchor_base_traces = _trace_concepts(
+        pipeline,
+        anchor_concepts,
+        anchor_token_indices,
+        module_names,
+        args,
+        device,
+        max_sequence_length,
+    )
+
     retain_inputs_by_module = {module_name: [] for module_name in module_names}
     retain_total = sum(
         1
@@ -205,7 +221,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     edit_dict = {}
     for _layer_index, layer_modules in sorted(grouped_modules.items()):
         layer_module_names = [module_name for module_name, _module in layer_modules]
-        layer_total = len(target_concepts) + len(anchor_concepts) + len(layer_modules)
+        layer_total = len(target_concepts) + len(layer_modules)
         with tqdm(total=layer_total, desc=f"layer {_layer_index}", dynamic_ncols=True, leave=False) as layer_pbar:
             layer_target_traces = _trace_concepts(
                 pipeline,
@@ -217,22 +233,12 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 max_sequence_length,
                 progress_bar=layer_pbar,
             )
-            layer_anchor_traces = _trace_concepts(
-                pipeline,
-                anchor_concepts,
-                anchor_token_indices,
-                layer_module_names,
-                args,
-                device,
-                max_sequence_length,
-                progress_bar=layer_pbar,
-            )
             for module_name, module in layer_modules:
                 sum_target_target, sum_target_anchor = [], []
                 for concept, anchor_concept in zip(target_concepts, anchor_concepts):
                     concept_trace = layer_target_traces[concept]
                     target_inputs = concept_trace[module_name]["inputs"]
-                    anchor_inputs = layer_anchor_traces[anchor_concept][module_name]["inputs"]
+                    anchor_inputs = anchor_base_traces[anchor_concept][module_name]["inputs"]
                     sum_target_target.append(target_inputs @ target_inputs.T)
                     sum_target_anchor.append(anchor_inputs @ target_inputs.T)
 
