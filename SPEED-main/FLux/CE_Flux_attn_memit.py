@@ -143,21 +143,15 @@ def _concept_matrices(target_inputs, anchor_inputs):
     return torch.stack(sum_target_anchor).mean(0), torch.stack(sum_target_target).mean(0)
 
 
-def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
-    if retain_inputs is None or retain_inputs.numel() == 0:
-        projector = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
-    else:
-        retain_inputs = retain_inputs.to(device=sum_target_target.device, dtype=sum_target_target.dtype)
-        covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
-        U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
-        null_basis = U[:, S < retain_threshold]
-        if null_basis.shape[1] == 0:
-            projector = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
-        else:
-            projector = null_basis @ null_basis.T
-    eye = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
-    delta = weight @ (sum_target_anchor - sum_target_target) @ projector @ (sum_target_target @ projector + update_lambda * eye).inverse()
-    return delta
+def _closed_form_update(residual_target, target_target, update_lambda, retain_inputs, retain_threshold):
+    retain_inputs = retain_inputs.to(device=target_target.device, dtype=target_target.dtype)
+    covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
+    U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
+    null_basis = U[:, S < retain_threshold]
+    eye = torch.eye(target_target.shape[0], device=target_target.device, dtype=target_target.dtype)
+    projector = eye if null_basis.shape[1] == 0 else null_basis @ null_basis.T
+    system = target_target @ projector + update_lambda * eye
+    return torch.linalg.solve(system.T, (residual_target @ projector).T).T
 
 
 def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512):
@@ -175,18 +169,8 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     for module_name, module, suffix in edit_modules:
         layer_index = int(re.match(r"transformer_blocks\.(\d+)\.", module_name).group(1))
         grouped_modules.setdefault(layer_index, []).append((module_name, module, suffix))
-
-    final_modules = {}
-    remaining_counts_by_module = {}
-    suffix_counts = {}
-    for module_name, _module, suffix in reversed(edit_modules):
-        suffix_counts[suffix] = suffix_counts.get(suffix, 0) + 1
-        final_modules.setdefault(suffix, module_name)
-        remaining_counts_by_module[module_name] = suffix_counts[suffix]
-
-    final_module_names = [final_modules[suffix] for suffix in selected_suffixes if suffix in final_modules]
-    if len(final_module_names) != len(selected_suffixes):
-        raise RuntimeError("Failed to resolve the final module for each requested attention suffix")
+    final_module_name = module_names[-1]
+    remaining_counts = {name: len(module_names) - index for index, name in enumerate(module_names)}
 
     target_token_indices = {
         concept: {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
@@ -205,7 +189,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         pipeline,
         anchor_concepts,
         anchor_token_indices,
-        final_module_names,
+        [final_module_name],
         args,
         device,
         max_sequence_length,
@@ -248,45 +232,40 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     edit_dict = {}
     for _layer_index, layer_modules in sorted(grouped_modules.items()):
         layer_module_names = [module_name for module_name, _module, _suffix in layer_modules]
-        trace_module_names = list(dict.fromkeys(layer_module_names + final_module_names))
         layer_total = len(target_concepts) + len(layer_modules)
         with tqdm(total=layer_total, desc=f"layer {_layer_index}", dynamic_ncols=True, leave=False) as layer_pbar:
-            layer_target_traces = _trace_concepts(
-                pipeline,
-                target_concepts,
-                target_token_indices,
-                trace_module_names,
-                args,
-                device,
-                max_sequence_length,
-                progress_bar=layer_pbar,
-            )
             for module_name, module, suffix in layer_modules:
-                final_module_name = final_modules[suffix]
-                remaining_count = remaining_counts_by_module[module_name]
-                target_inputs, anchor_inputs = [], []
+                trace_names = [module_name] if module_name == final_module_name else [module_name, final_module_name]
+                target_traces = _trace_concepts(
+                    pipeline,
+                    target_concepts,
+                    target_token_indices,
+                    trace_names,
+                    args,
+                    device,
+                    max_sequence_length,
+                )
+                target_inputs, residuals = [], []
                 for concept, anchor_concept in zip(target_concepts, anchor_concepts):
-                    concept_trace = layer_target_traces[concept]
-                    final_current = concept_trace[final_module_name]["outputs"]
-                    anchor = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(final_current.device, final_current.dtype)
+                    concept_trace = target_traces[concept]
+                    current_final = concept_trace[final_module_name]["outputs"]
+                    anchor_final = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(current_final.device, current_final.dtype)
                     target_inputs.append(concept_trace[module_name]["inputs"])
-                    anchor_inputs.append(concept_trace[module_name]["inputs"] + (anchor - final_current) * (args.residual_scale / remaining_count))
+                    residuals.append((anchor_final - current_final) / remaining_counts[module_name])
 
-                sum_target_anchor, sum_target_target = _concept_matrices(target_inputs, anchor_inputs)
-                sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
-                sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
+                residual_target, target_target = _concept_matrices(target_inputs, residuals)
+                residual_target = residual_target.to(module.weight.device, torch.float32)
+                target_target = target_target.to(module.weight.device, torch.float32)
                 retain_inputs = retain_inputs_by_module[module_name]
 
-                weight_before = module.weight.float()
                 delta = _closed_form_update(
-                    sum_target_anchor,
-                    sum_target_target,
-                    weight_before,
+                    residual_target,
+                    target_target,
                     args.update_lambda,
                     None if retain_inputs is None else retain_inputs.to(module.weight.device, torch.float32),
                     args.threshold,
                 )
-                module.weight = torch.nn.Parameter(weight_before.add(delta).to(module.weight.dtype))
+                module.weight = torch.nn.Parameter(module.weight.float().add(delta).to(module.weight.dtype))
                 edit_dict[module_name + ".weight"] = module.weight.detach().clone()
                 layer_pbar.update(1)
     return edit_dict

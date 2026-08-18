@@ -320,7 +320,7 @@ def main() -> None:
     args = parse_args()
     if args.overwrite and args.output.exists():
         args.output.unlink()
-    print("Loading FLUX.2 Klein 4B generation pipeline...")
+    print(f"Loading generation pipeline: {args.model_id}")
     pipeline = load_generation_pipeline(args.model_id, args.generation_device)
     print(
         f"Using GCD evaluator {args.gcd_script} with "
