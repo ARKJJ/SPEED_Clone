@@ -10,8 +10,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.2-klein-4B}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-FLux/logs/checkpoints}"
-SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-FLux/logs/FLUX2_MLP}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-FLux/logs/checkpoints/memit}"
+SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-FLux/logs/FLUX2_MLP_MEMIT}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-4}"
 THRESHOLD="${THRESHOLD:-3e-2}"
@@ -83,7 +83,7 @@ run_task() {
   fi
 
   echo "FLUX MLP: editing [${erase_type}] [${limited_target} -> ${anchor}] on GPU [${gpu_id}] with [all MLP layers, trace_steps=${TRACE_NUM_STEPS}]"
-  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/CE_Flux_mlp.py \
+  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/CE_Flux_mlp_memit.py \
     --sd_ckpt "${SD_CKPT}" \
     --device "cuda:0" \
     --target_concepts "${target}" \

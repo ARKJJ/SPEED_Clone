@@ -63,15 +63,6 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
     return [valid_length - 1]
 
 
-def _load_flux_pipeline(model_id, device, torch_dtype):
-    if Flux2KleinPipeline is None:
-        raise RuntimeError("Flux2KleinPipeline is unavailable in this diffusers install")
-    pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
-    pipe.vae.enable_slicing()
-    pipe.vae.enable_tiling()
-    return pipe
-
-
 def _select_text_mlp_modules(transformer, device):
     selected = []
     layer_pattern = re.compile(r"transformer_blocks\.(\d+)\.")
@@ -87,16 +78,6 @@ def _select_text_mlp_modules(transformer, device):
     if not selected:
         raise RuntimeError("No Flux2 text MLP modules found: expected transformer_blocks.*.ff_context.linear_out")
     return selected
-
-
-def _group_mlp_modules_by_layer(edit_modules):
-    grouped = {}
-    for module_name, module in edit_modules:
-        match = re.match(r"transformer_blocks\.(\d+)\.", module_name)
-        if match is None:
-            continue
-        grouped.setdefault(int(match.group(1)), []).append((module_name, module))
-    return [(layer_index, grouped[layer_index]) for layer_index in sorted(grouped)]
 
 
 def _trace_concepts(pipeline, concepts, token_indices, module_names, args, device, max_sequence_length):
@@ -161,12 +142,6 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
     return traced_concepts
 
 
-def _concept_matrices(target_inputs, anchor_inputs):
-    sum_target_target = [target @ target.T for target in target_inputs]
-    sum_target_anchor = [anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]
-    return torch.stack(sum_target_anchor).mean(0), torch.stack(sum_target_target).mean(0)
-
-
 def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
     retain_inputs = retain_inputs.to(device=sum_target_target.device, dtype=sum_target_target.dtype)
     covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
@@ -184,12 +159,14 @@ def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lam
 
 
 def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512,):
-    edit_modules = _select_text_mlp_modules(
-        pipeline.transformer,
-        device,
-    )
+    edit_modules = _select_text_mlp_modules(pipeline.transformer, device)
     module_names = [name for name, _ in edit_modules]
-    grouped_modules = _group_mlp_modules_by_layer(edit_modules)
+    grouped_modules = {}
+    for module_name, module in edit_modules:
+        match = re.match(r"transformer_blocks\.(\d+)\.", module_name)
+        if match is None:
+            continue
+        grouped_modules.setdefault(int(match.group(1)), []).append((module_name, module))
 
     anchor_token_indices = {}
     target_token_indices = {}
@@ -202,18 +179,14 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             "indices": _subject_token_indices(anchor_concept, pipeline.tokenizer, max_sequence_length),
             "pool": True,
         }
-    retain_token_indices = {}
-    for concept in retain_texts:
-        if concept == "":
-            retain_token_indices[concept] = {
-                "indices": list(range(1, max_sequence_length)),
-                "pool": False,
-            }
-        else:
-            retain_token_indices[concept] = {
-                "indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length),
-                "pool": True,
-            }
+    retain_token_indices = {
+        concept: (
+            {"indices": list(range(1, max_sequence_length)), "pool": False}
+            if concept == ""
+            else {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
+        )
+        for concept in retain_texts
+    }
 
     anchor_base_traces = _trace_concepts(
         pipeline,
@@ -244,7 +217,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         retain_inputs_by_module[module_name] = torch.cat(retain_inputs_by_module[module_name], dim=1)
 
     edit_dict = {}
-    for _, layer_modules in grouped_modules:
+    for _layer_index, layer_modules in sorted(grouped_modules.items()):
         layer_module_names = [module_name for module_name, _module in layer_modules]
         layer_target_traces = _trace_concepts(pipeline, target_concepts, target_token_indices, layer_module_names, args, device, max_sequence_length)
         for module_name, module in layer_modules:
@@ -254,7 +227,8 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 target_inputs.append(concept_trace[module_name]["inputs"])
                 anchor_inputs.append(anchor_base_traces[anchor_concept][module_name]["inputs"])
 
-            sum_target_anchor, sum_target_target = _concept_matrices(target_inputs, anchor_inputs)
+            sum_target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
+            sum_target_anchor = torch.stack([anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]).mean(0)
             sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
             sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
             retain_inputs = retain_inputs_by_module[module_name]
@@ -324,7 +298,11 @@ if __name__ == "__main__":
         if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", text.lower()) for concept in target_concepts)
     ]
 
-    pipeline = _load_flux_pipeline(args.sd_ckpt, args.device, torch.bfloat16)
+    if Flux2KleinPipeline is None:
+        raise RuntimeError("Flux2KleinPipeline is unavailable in this diffusers install")
+    pipeline = Flux2KleinPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
+    pipeline.vae.enable_slicing()
+    pipeline.vae.enable_tiling()
     edit_dict = edit_model(
         args=args,
         pipeline=pipeline,

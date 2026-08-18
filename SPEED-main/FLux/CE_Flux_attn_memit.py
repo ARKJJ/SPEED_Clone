@@ -14,12 +14,21 @@ from diffusers import Flux2KleinPipeline
 ATTENTION_SUFFIXES = {"Q": ".attn.add_q_proj", "K": ".attn.add_k_proj", "V": ".attn.add_v_proj"}
 
 
-def _subject_token_indices(prompt, tokenizer, max_sequence_length):
+def _apply_flux2_chat_template(prompt, tokenizer):
     messages = [{"role": "user", "content": prompt}]
     try:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
     except TypeError:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def _subject_token_indices(prompt, tokenizer, max_sequence_length):
+    text = _apply_flux2_chat_template(prompt, tokenizer)
     token_inputs = tokenizer(text, padding="max_length", max_length=max_sequence_length, truncation=True, return_tensors="pt")
     valid_length = int(token_inputs.attention_mask[0].sum().item())
     if valid_length <= 0:
@@ -40,11 +49,7 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
-    content_indices = [
-        idx
-        for idx, token_id in enumerate(input_ids)
-        if int(token_id) not in special_ids and idx < search_end
-    ]
+    content_indices = [idx for idx, token_id in enumerate(input_ids) if int(token_id) not in special_ids and idx < search_end]
     if content_indices:
         return [content_indices[-1]]
     return [valid_length - 1]
@@ -301,7 +306,7 @@ if __name__ == "__main__":
     parser.add_argument("--trace_batch_size", type=int, default=4)
     parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
     parser.add_argument("--threshold", type=float, default=1e-1)
-    parser.add_argument("--trace_num_steps", type=int, default=20)
+    parser.add_argument("--trace_num_steps", type=int, default=4)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=0.1)

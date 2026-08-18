@@ -12,33 +12,34 @@ cd "${PROJECT_ROOT}"
 # ========== Input Params ==========
 SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.2-klein-4B}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-FLux/logs/checkpoints}"
-SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-FLux/logs/FLUX}"
+SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-FLux/logs/FLUX2}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-PARAMS="${PARAMS:-V}"
-TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-10}"
-THRESHOLD="${THRESHOLD:-1e-1}"
-UPDATE_LAMBDA="${UPDATE_LAMBDA:-1e-2}"
-MODE="${MODE:-edit}"
+PARAMS="${PARAMS:-QKV}"
+TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-4}"
+THRESHOLD="${THRESHOLD:-5e-2}"
+UPDATE_LAMBDA="${UPDATE_LAMBDA:-0.1}"
+MODE="${MODE:-original,edit}"
 NUM_SAMPLES="${NUM_SAMPLES:-10}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
 COCO_NUM_SAMPLES="${COCO_NUM_SAMPLES:-1}"
-TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-20}"
+TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-4}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
 MAX_NUM="${MAX_NUM:-}"
 RUN_SCORE="${RUN_SCORE:-1}"
-IFS=',' read -ra GPU_IDX <<< "${GPU_IDS:-0,1,2,3,4}"
+SCORE_ONLY="${SCORE_ONLY:-1}"
+IFS=',' read -ra GPU_IDX <<< "${GPU_IDS:-0,1,2,3}"
 # ==================================
 
 # Erase Task Config
-erase_types=("instance" "style")
+erase_types=("instance")
 # ==================================================================
 targets_map["instance"]="Snoopy;Snoopy, Mickey;Snoopy, Mickey, Spongebob"
-anchors_map["instance"]=" ; ; "
+anchors_map["instance"]="animal;animal;animal"
 contents_map["instance"]="Snoopy, Mickey, Spongebob, Pikachu, Hello Kitty"
 # contents_map["instance"]="coco"
 # ==================================================================
 targets_map["style"]="Van Gogh;Picasso;Monet"
-anchors_map["style"]="art;art;art"
+anchors_map["style"]="painting;painting;painting"
 contents_map["style"]="Van Gogh, Picasso, Monet, Paul Gauguin, Caravaggio"
 # contents_map["style"]="coco"
 # ==================================================================
@@ -96,6 +97,11 @@ run_task() {
   target_root="${save_root}/${erase_type}"
   contents="${contents_map[$erase_type]}"
 
+  if [[ "${SCORE_ONLY}" == "1" ]]; then
+    RUN_SCORE=1 score_target "${erase_type}" "${target_root}/${limited_target}" "${contents}" "${gpu_id}"
+    return
+  fi
+
   echo "FLUX: editing [${erase_type}] [${limited_target} -> ${anchor:-null}] on GPU [${gpu_id}] with [params=${PARAMS}, trace_steps=${TRACE_NUM_STEPS}, threshold=${THRESHOLD}]"
   CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/CE_Flux.py \
     --sd_ckpt "${SD_CKPT}" \
@@ -146,20 +152,23 @@ run_task() {
       --total_timesteps "${TOTAL_TIMESTEPS}" \
       --guidance_scale "${GUIDANCE_SCALE}"
   fi
+
+  score_target "${erase_type}" "${target_root}/${limited_target}" "${contents}" "${gpu_id}"
 }
 
-score_erase_type() {
+score_target() {
   local erase_type="$1"
-  local save_root="$2"
-  local contents="${contents_map[$erase_type]}"
+  local target_path="$2"
+  local contents="$3"
+  local gpu_id="$4"
 
   if [[ "${RUN_SCORE}" != "1" ]]; then
     return
   fi
 
-  CUDA_VISIBLE_DEVICES="${GPU_IDX[0]}" "${PYTHON_BIN}" FLux/score_cal.py \
+  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/score_cal.py \
     --contents "${contents}" \
-    --root_path "${save_root}/${erase_type}" \
+    --root_path "${target_path}" \
     --sub_root "edit" \
     --pretrained_path "FLux/data/pretrain/${erase_type}"
 }
@@ -184,7 +193,6 @@ for erase_type in "${erase_types[@]}"; do
 
   wait
   gpu_idx=0
-  score_erase_type "${erase_type}" "${save_root}"
 done
 
 wait

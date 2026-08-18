@@ -14,21 +14,15 @@ from diffusers import Flux2KleinPipeline
 ATTENTION_SUFFIXES = {"Q": ".attn.add_q_proj", "K": ".attn.add_k_proj", "V": ".attn.add_v_proj"}
 
 
-def _apply_flux2_chat_template(prompt, tokenizer):
+def _subject_token_indices(prompt, tokenizer, max_sequence_length):
+    if prompt == "":
+        return [0]
+
     messages = [{"role": "user", "content": prompt}]
     try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     except TypeError:
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-
-def _subject_token_indices(prompt, tokenizer, max_sequence_length):
-    text = _apply_flux2_chat_template(prompt, tokenizer)
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     token_inputs = tokenizer(text, padding="max_length", max_length=max_sequence_length, truncation=True, return_tensors="pt")
     valid_length = int(token_inputs.attention_mask[0].sum().item())
     if valid_length <= 0:
@@ -44,8 +38,8 @@ def _subject_token_indices(prompt, tokenizer, max_sequence_length):
         span_length = len(prompt_ids)
         for start_idx in range(0, valid_length - span_length + 1):
             if input_ids[start_idx:start_idx + span_length] == prompt_ids:
-                return [start_idx + span_length - 1]
-
+                 return [start_idx + span_length - 1]
+            
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length

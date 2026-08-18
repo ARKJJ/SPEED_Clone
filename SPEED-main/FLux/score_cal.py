@@ -1,5 +1,6 @@
 import os
 import argparse
+import traceback
 import torch
 import torch_fidelity
 import pandas as pd
@@ -8,6 +9,18 @@ from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
+
+
+def _as_feature_tensor(output):
+    if torch.is_tensor(output):
+        return output
+    if hasattr(output, 'pooler_output') and output.pooler_output is not None:
+        return output.pooler_output
+    if hasattr(output, 'last_hidden_state') and output.last_hidden_state is not None:
+        return output.last_hidden_state[:, 0]
+    if isinstance(output, (tuple, list)) and output:
+        return output[0]
+    raise TypeError(f"Cannot extract feature tensor from {type(output).__name__}")
 
 
 class Generate_Dataset(Dataset):
@@ -48,9 +61,11 @@ class CLIP_Score():
         torch.cuda.empty_cache()
         images_feats = self.processor(images=[Image.open(img) for img in images], return_tensors="pt").to(self.device)
         images_feats = self.model.get_image_features(**images_feats)
+        images_feats = _as_feature_tensor(images_feats)
 
         texts_feats = self.tokenizer(texts, padding=True, truncation=True, max_length=77, return_tensors="pt",).to(self.device)
         texts_feats = self.model.get_text_features(**texts_feats)
+        texts_feats = _as_feature_tensor(texts_feats)
 
         images_feats = images_feats / images_feats.norm(dim=1, p=2, keepdim=True)
         texts_feats = texts_feats / texts_feats.norm(dim=1, p=2, keepdim=True)
@@ -72,6 +87,20 @@ def has_baseline_record(txt_content, content):
     )
 
 
+def baseline_image_dir(root_path, pretrained_path, content):
+    if content == 'coco':
+        return "data/pretrain/coco/coco/original"
+    pretrained_candidate = os.path.join(pretrained_path, content, 'original')
+    if os.path.isdir(pretrained_candidate):
+        return pretrained_candidate
+    local_candidate = os.path.join(root_path, content, 'original')
+    if os.path.isdir(local_candidate):
+        return local_candidate
+    raise FileNotFoundError(
+        f"Missing baseline images for '{content}'. Checked {pretrained_candidate} and {local_candidate}"
+    )
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--contents', type=str)
@@ -82,6 +111,8 @@ if __name__ == '__main__':
 
     contents = [item.strip() for item in args.contents.split(',')]
     root_paths = find_root_paths(args.root_path, args.sub_root)
+    if not root_paths:
+        raise RuntimeError(f"No '{args.sub_root}' directories found under {args.root_path}")
 
     CS_calculator = CLIP_Score()
 
@@ -101,13 +132,14 @@ if __name__ == '__main__':
                 dataset = Generate_Dataset(root_path, content, args.sub_root)
                 dataloader = DataLoader(dataset, batch_size=10)
                 CS = CS_calculator(dataloader)
-                baseline_root = "data/pretrain/coco" if content == 'coco' else args.pretrained_path
+                baseline_dir = baseline_image_dir(root_path, args.pretrained_path, content)
+                baseline_root = os.path.dirname(os.path.dirname(baseline_dir))
                 baseline_dataset = Generate_Dataset(baseline_root, content, 'original')
                 baseline_dataloader = DataLoader(baseline_dataset, batch_size=10)
                 baseline_CS = CS_calculator(baseline_dataloader)
                 FIDELITY = torch_fidelity.calculate_metrics(
                     input1=os.path.join(root_path, content, args.sub_root),
-                    input2=os.path.join(args.pretrained_path, content, 'original') if content != 'coco' else "data/pretrain/coco/coco/original",
+                    input2=baseline_dir,
                     cuda=True,
                     fid=True,
                     verbose=False,
@@ -119,4 +151,5 @@ if __name__ == '__main__':
                         f"FID is {FIDELITY['frechet_inception_distance']} \n"
                     )
         except Exception as e:
-            pass
+            traceback.print_exc()
+            raise RuntimeError(f"Failed to calculate metrics for {root_path}") from e
