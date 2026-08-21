@@ -5,76 +5,26 @@ import torch
 import argparse
 import pandas as pd
 from tqdm import tqdm
-from diffusers import DiffusionPipeline
 from diffusers.utils import logging as diffusers_logging
 from safetensors.torch import save_file
-from diffusers import Flux2KleinPipeline
-
+from diffusers import DiffusionPipeline
 
 ATTENTION_SUFFIXES = {"Q": ".attn.add_q_proj", "K": ".attn.add_k_proj", "V": ".attn.add_v_proj"}
 
 
-def _subject_token_indices(prompt, tokenizer, max_sequence_length):
-    if prompt == "":
-        return [0]
-
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    except TypeError:
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    token_inputs = tokenizer(text, padding="max_length", max_length=max_sequence_length, truncation=True, return_tensors="pt")
-    valid_length = int(token_inputs.attention_mask[0].sum().item())
-    if valid_length <= 0:
-        return [0]
-
-    input_ids = [int(token_id) for token_id in token_inputs.input_ids[0, :valid_length].tolist()]
-    try:
-        prompt_ids = tokenizer(prompt, add_special_tokens=False, truncation=True, return_tensors="pt").input_ids[0].tolist()
-    except TypeError:
-        prompt_ids = tokenizer(prompt, truncation=True, return_tensors="pt").input_ids[0].tolist()
-    prompt_ids = [int(token_id) for token_id in prompt_ids]
-    if prompt_ids:
-        span_length = len(prompt_ids)
-        for start_idx in range(0, valid_length - span_length + 1):
-            if input_ids[start_idx:start_idx + span_length] == prompt_ids:
-                 return [start_idx + span_length - 1]
-            
-    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
-    content_indices = [idx for idx, token_id in enumerate(input_ids) if int(token_id) not in special_ids and idx < search_end]
-    if content_indices:
-        return [content_indices[-1]]
-    return [valid_length - 1]
-
-
-def _trace_concepts(
-    pipeline,
-    concepts,
-    token_indices,
-    module_names,
-    args,
-    device,
-    max_sequence_length,
-    progress_bar=None,
-):
+def _trace_concepts(pipeline,concepts,token_indices, module_names, args, device,max_sequence_length, progress_bar=None):
     module_lookup = dict(pipeline.transformer.named_modules())
     traced_concepts = {}
-    trace_batch_size = max(1, int(getattr(args, "trace_batch_size", 1)))
+    trace_batch_size = max(1, args.trace_batch_size)
     grouped_concepts = {}
 
     for concept in dict.fromkeys(concepts):
-        token_spec = token_indices.get(concept)
-        if not token_spec:
-            continue
-        selected_token_indices = list(token_spec["indices"])
-        pool_selected_tokens = bool(token_spec.get("pool", False))
+        selected_token_indices = token_indices.get(concept)
         if not selected_token_indices:
             continue
-        grouped_concepts.setdefault((tuple(selected_token_indices), pool_selected_tokens), []).append(concept)
+        grouped_concepts.setdefault(tuple(selected_token_indices), []).append(concept)
 
-    for (selected_token_indices, pool_selected_tokens), grouped in grouped_concepts.items():
+    for selected_token_indices, grouped in grouped_concepts.items():
         selected_token_indices = list(selected_token_indices)
         for start in range(0, len(grouped), trace_batch_size):
             concept_batch = grouped[start:start + trace_batch_size]
@@ -85,8 +35,6 @@ def _trace_concepts(
 
                 def pre_hook(_module, inputs, module_name=name):
                     selected_inputs = inputs[0][:, selected_token_indices, :]
-                    if pool_selected_tokens:
-                        selected_inputs = selected_inputs.mean(dim=1, keepdim=True)
                     traces[module_name]["inputs"].append(selected_inputs.detach().float())
 
                 handles.append(module.register_forward_pre_hook(pre_hook))
@@ -100,7 +48,7 @@ def _trace_concepts(
                     prompt=concept_batch,
                     generator=generators,
                     num_inference_steps=args.trace_num_steps,
-                    guidance_scale=3.5,
+                    guidance_scale=0.0,
                     height=args.trace_resolution,
                     width=args.trace_resolution,
                     max_sequence_length=max_sequence_length,
@@ -136,14 +84,14 @@ def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lam
     return delta
 
 
-def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512,):
+def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=256,):
     selected_suffixes = [ATTENTION_SUFFIXES[param] for param in args.params]
     edit_modules = []
     for name, module in pipeline.transformer.named_modules():
         if hasattr(module, "weight") and module.weight is not None and any(suffix in name for suffix in selected_suffixes):
             match = re.match(r"transformer_blocks\.(\d+)\.", name)
             if match is not None:
-                edit_modules.append((name, module.to(device)))
+                edit_modules.append((name, module))
     if not edit_modules:
         raise RuntimeError(f"No text-side attention modules selected for params={args.params}")
     module_names = [name for name, _ in edit_modules]
@@ -152,38 +100,49 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         layer_index = int(re.match(r"transformer_blocks\.(\d+)\.", module_name).group(1))
         grouped_modules.setdefault(layer_index, []).append((module_name, module))
 
+    non_empty_concepts = [
+        concept
+        for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts)
+        if concept != ""
+    ]
+    concept_token_indices = {}
+    for concept in non_empty_concepts:
+        token_inputs = pipeline.tokenizer_2(
+            concept,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        token_index = int(token_inputs.attention_mask[0].sum().item()) - 2
+        if token_index < 0:
+            raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
+        concept_token_indices[concept] = [token_index]
+
     target_token_indices = {
-        concept: {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
+        concept: concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
+        concept: [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
     for concept in target_concepts:
-        print(f"target {concept}: {target_token_indices[concept]['indices']}")
+        print(f"target {concept}: {target_token_indices[concept]}")
     for concept in anchor_concepts:
-        print(f"anchor {concept}: {anchor_token_indices[concept]['indices']}")
+        print(f"anchor {concept}: {anchor_token_indices[concept]}")
     retain_token_indices = {
-        concept: {"indices": list(range(1, max_sequence_length)), "pool": False} if concept == "" else {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
+        concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
         for concept in retain_texts
     }
 
-    anchor_base_traces = _trace_concepts(
-        pipeline,
-        anchor_concepts,
-        anchor_token_indices,
-        module_names,
-        args,
-        device,
-        max_sequence_length,
-    )
+    anchor_base_traces = _trace_concepts(pipeline,anchor_concepts,anchor_token_indices,module_names,args,device,max_sequence_length)
 
     retain_inputs_by_module = {module_name: [] for module_name in module_names}
     retain_total = sum(
         1
         for concept in retain_texts
-        if retain_token_indices.get(concept) and retain_token_indices[concept]["indices"]
+        if retain_token_indices.get(concept)
     )
     with tqdm(total=retain_total, desc="retain trace", dynamic_ncols=True, leave=True) as retain_pbar:
         for j in range(0, len(retain_texts), args.chunk_size):
@@ -196,7 +155,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 args,
                 device,
                 max_sequence_length,
-                progress_bar=retain_pbar,
+                progress_bar=retain_pbar
             )
             for module_name in module_names:
                 retain_inputs = [
@@ -225,7 +184,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 args,
                 device,
                 max_sequence_length,
-                progress_bar=layer_pbar,
+                progress_bar=layer_pbar
             )
             for module_name, module in layer_modules:
                 sum_target_target, sum_target_anchor = [], []
@@ -257,7 +216,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.2-klein-4B")
+    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.1-schnell")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--file_name", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
@@ -269,17 +228,14 @@ if __name__ == "__main__":
     parser.add_argument("--trace_batch_size", type=int, default=4)
     parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
     parser.add_argument("--threshold", type=float, default=1e-1)
-    parser.add_argument("--trace_num_steps", type=int, default=20)
+    parser.add_argument("--trace_num_steps", type=int, default=4)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=0.1)
     args = parser.parse_args()
 
     diffusers_logging.set_verbosity_error()
-    try:
-        diffusers_logging.disable_progress_bar()
-    except AttributeError:
-        pass
+    diffusers_logging.disable_progress_bar()
 
     target_concepts = [con.strip() for con in args.target_concepts.split(",")]
     if not target_concepts or any(concept == "" for concept in target_concepts):
@@ -312,18 +268,10 @@ if __name__ == "__main__":
         if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", text.lower()) for concept in target_concepts)
     ]
 
-    if "flux.2-klein" in args.sd_ckpt.lower():
-        if Flux2KleinPipeline is None:
-            raise RuntimeError("Flux2KleinPipeline is unavailable in this diffusers install.")
-        pipeline = Flux2KleinPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
-    else:
-        pipeline = DiffusionPipeline.from_pretrained(args.sd_ckpt, safety_checker=None, torch_dtype=torch.bfloat16).to(args.device)
+    pipeline = DiffusionPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
-    try:
-        pipeline.set_progress_bar_config(disable=True)
-    except AttributeError:
-        pass
+    pipeline.set_progress_bar_config(disable=True)
     edit_dict = edit_model(
         args=args,
         pipeline=pipeline,
@@ -331,7 +279,7 @@ if __name__ == "__main__":
         anchor_concepts=anchor_concepts,
         retain_texts=retain_texts,
         device=args.device,
-        max_sequence_length=512,
+        max_sequence_length=256,
     )
 
     save_path = args.save_path or "logs/checkpoints"

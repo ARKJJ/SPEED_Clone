@@ -4,7 +4,6 @@ import time
 import torch
 import argparse
 import pandas as pd
-from diffusers import DiffusionPipeline
 from diffusers.utils import logging as diffusers_logging
 from safetensors.torch import save_file
 from tqdm import tqdm
@@ -12,48 +11,6 @@ from diffusers import Flux2KleinPipeline
 
 
 ATTENTION_SUFFIXES = {"Q": ".attn.add_q_proj", "K": ".attn.add_k_proj", "V": ".attn.add_v_proj"}
-
-
-def _apply_flux2_chat_template(prompt, tokenizer):
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-    except TypeError:
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-
-def _subject_token_indices(prompt, tokenizer, max_sequence_length):
-    text = _apply_flux2_chat_template(prompt, tokenizer)
-    token_inputs = tokenizer(text, padding="max_length", max_length=max_sequence_length, truncation=True, return_tensors="pt")
-    valid_length = int(token_inputs.attention_mask[0].sum().item())
-    if valid_length <= 0:
-        return [0]
-
-    input_ids = [int(token_id) for token_id in token_inputs.input_ids[0, :valid_length].tolist()]
-    try:
-        prompt_ids = tokenizer(prompt, add_special_tokens=False, truncation=True, return_tensors="pt").input_ids[0].tolist()
-    except TypeError:
-        prompt_ids = tokenizer(prompt, truncation=True, return_tensors="pt").input_ids[0].tolist()
-    prompt_ids = [int(token_id) for token_id in prompt_ids]
-    if prompt_ids:
-        span_length = len(prompt_ids)
-        for start_idx in range(0, valid_length - span_length + 1):
-            if input_ids[start_idx:start_idx + span_length] == prompt_ids:
-                return [start_idx + span_length - 1]
-
-    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
-    search_end = input_ids.index(eos_token_id) if eos_token_id in input_ids else valid_length
-    content_indices = [idx for idx, token_id in enumerate(input_ids) if int(token_id) not in special_ids and idx < search_end]
-    if content_indices:
-        return [content_indices[-1]]
-    return [valid_length - 1]
-
 
 def _trace_concepts(
     pipeline,
@@ -71,16 +28,12 @@ def _trace_concepts(
     grouped_concepts = {}
 
     for concept in dict.fromkeys(concepts):
-        token_spec = token_indices.get(concept)
-        if not token_spec:
-            continue
-        selected_token_indices = list(token_spec["indices"])
-        pool_selected_tokens = bool(token_spec.get("pool", False))
+        selected_token_indices = token_indices.get(concept)
         if not selected_token_indices:
             continue
-        grouped_concepts.setdefault((tuple(selected_token_indices), pool_selected_tokens), []).append(concept)
+        grouped_concepts.setdefault(tuple(selected_token_indices), []).append(concept)
 
-    for (selected_token_indices, pool_selected_tokens), grouped in grouped_concepts.items():
+    for selected_token_indices, grouped in grouped_concepts.items():
         selected_token_indices = list(selected_token_indices)
         for start in range(0, len(grouped), trace_batch_size):
             concept_batch = grouped[start:start + trace_batch_size]
@@ -91,14 +44,11 @@ def _trace_concepts(
 
                 def pre_hook(_module, inputs, module_name=name):
                     selected_inputs = inputs[0][:, selected_token_indices, :]
-                    if pool_selected_tokens:
-                        selected_inputs = selected_inputs.mean(dim=1, keepdim=True)
                     traces[module_name]["inputs"].append(selected_inputs.detach().float())
 
                 def out_hook(_module, _inputs, output, module_name=name):
                     output = output[0] if isinstance(output, tuple) else output
-                    if pool_selected_tokens:
-                        output = output[:, selected_token_indices, :].mean(dim=1, keepdim=True)
+                    output = output[:, selected_token_indices, :]
                     traces[module_name]["outputs"].append(output.detach().float())
 
                 handles.append(module.register_forward_pre_hook(pre_hook))
@@ -136,13 +86,6 @@ def _trace_concepts(
                 progress_bar.update(len(concept_batch))
     return traced_concepts
 
-
-def _concept_matrices(target_inputs, anchor_inputs):
-    sum_target_target = [target @ target.T for target in target_inputs]
-    sum_target_anchor = [anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]
-    return torch.stack(sum_target_anchor).mean(0), torch.stack(sum_target_target).mean(0)
-
-
 def _closed_form_update(residual_target, target_target, update_lambda, retain_inputs, retain_threshold):
     retain_inputs = retain_inputs.to(device=target_target.device, dtype=target_target.dtype)
     covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
@@ -161,7 +104,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         if hasattr(module, "weight") and module.weight is not None and any(suffix in name for suffix in selected_suffixes):
             match = re.match(r"transformer_blocks\.(\d+)\.", name)
             if match is not None:
-                edit_modules.append((name, module.to(device), next(suffix for suffix in selected_suffixes if suffix in name)))
+                edit_modules.append((name, module, next(suffix for suffix in selected_suffixes if suffix in name)))
     if not edit_modules:
         raise RuntimeError(f"No text-side attention modules selected for params={args.params}")
     module_names = [name for name, _, _ in edit_modules]
@@ -172,16 +115,47 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     final_module_name = module_names[-1]
     remaining_counts = {name: len(module_names) - index for index, name in enumerate(module_names)}
 
+    non_empty_concepts = [
+        concept
+        for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts)
+        if concept != ""
+    ]
+    concept_token_indices = {}
+    for concept in non_empty_concepts:
+        text = pipeline.tokenizer.apply_chat_template(
+            [{"role": "user", "content": concept}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        suffix_text = text.split(concept, 1)[1]
+        suffix_length = int(pipeline.tokenizer(
+            suffix_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).attention_mask[0].sum().item())
+        full_length = int(pipeline.tokenizer(
+            text,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        ).attention_mask[0].sum().item())
+        token_index = full_length - suffix_length - 1
+        if token_index < 0:
+            raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
+        concept_token_indices[concept] = [token_index]
+
     target_token_indices = {
-        concept: {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
+        concept: concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
+        concept: [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
     retain_token_indices = {
-        concept: {"indices": list(range(1, max_sequence_length)), "pool": False} if concept == "" else {"indices": _subject_token_indices(concept, pipeline.tokenizer, max_sequence_length), "pool": True}
+        concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
         for concept in retain_texts
     }
 
@@ -199,7 +173,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     retain_total = sum(
         1
         for concept in retain_texts
-        if retain_token_indices.get(concept) and retain_token_indices[concept]["indices"]
+        if retain_token_indices.get(concept)
     )
     with tqdm(total=retain_total, desc="retain trace", dynamic_ncols=True, leave=True) as retain_pbar:
         for j in range(0, len(retain_texts), args.chunk_size):
@@ -253,7 +227,8 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                     target_inputs.append(concept_trace[module_name]["inputs"])
                     residuals.append((anchor_final - current_final) / remaining_counts[module_name])
 
-                residual_target, target_target = _concept_matrices(target_inputs, residuals)
+                target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
+                residual_target = torch.stack([residual @ target.T for target, residual in zip(target_inputs, residuals)]).mean(0)
                 residual_target = residual_target.to(module.weight.device, torch.float32)
                 target_target = target_target.to(module.weight.device, torch.float32)
                 retain_inputs = retain_inputs_by_module[module_name]
@@ -330,16 +305,7 @@ if __name__ == "__main__":
         if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", str(text).lower()) for concept in target_concepts)
     ]
 
-    if "flux.2-klein" in args.sd_ckpt.lower():
-        if Flux2KleinPipeline is None:
-            raise RuntimeError("Flux2KleinPipeline is unavailable in this diffusers install.")
-        pipeline = Flux2KleinPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
-    else:
-        pipeline = DiffusionPipeline.from_pretrained(
-            args.sd_ckpt,
-            safety_checker=None,
-            torch_dtype=torch.bfloat16,
-        ).to(args.device)
+    pipeline = Flux2KleinPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
     try:
