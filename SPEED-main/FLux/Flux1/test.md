@@ -1,5 +1,5 @@
 CUDA_VISIBLE_DEVICES=0 python attn_memit.py \
-  --sd_ckpt "black-forest-labs/FLUX.2-klein-4B" \
+  --sd_ckpt "black-forest-labs/FLUX.1-schnell" \
   --device "cuda:0" \
   --target_concepts "Mickey" \
   --anchor_concepts "cat" \
@@ -12,7 +12,7 @@ CUDA_VISIBLE_DEVICES=0 python attn_memit.py \
   --trace_num_steps 4 
 
  CUDA_VISIBLE_DEVICES=0 python mlp_memit.py \
-  --sd_ckpt "black-forest-labs/FLUX.2-klein-4B" \
+  --sd_ckpt "black-forest-labs/FLUX.1-schnell" \
   --target_concepts "Snoopy" \
   --anchor_concepts "cat" \
   --heads concept \
@@ -23,9 +23,8 @@ CUDA_VISIBLE_DEVICES=0 python attn_memit.py \
   --save_path logs/checkpoints \
   --file_name Snoopy_cat_
 
-
  CUDA_VISIBLE_DEVICES=0 python mlp.py \
-  --sd_ckpt "black-forest-labs/FLUX.2-klein-4B" \
+  --sd_ckpt "black-forest-labs/FLUX.1-schnell" \
   --target_concepts "Snoopy" \
   --anchor_concepts "cat" \
   --heads concept \
@@ -38,7 +37,7 @@ CUDA_VISIBLE_DEVICES=0 python attn_memit.py \
 
 
   CUDA_VISIBLE_DEVICES=0 python attn.py \
-  --sd_ckpt "black-forest-labs/FLUX.2-klein-4B" \
+  --sd_ckpt "black-forest-labs/FLUX.1-schnell" \
   --device "cuda:0" \
   --trace_num_steps 4 \
   --retain_path "../data/instance.csv" \
@@ -53,13 +52,13 @@ CUDA_VISIBLE_DEVICES=0 python attn_memit.py \
 
 
   CUDA_VISIBLE_DEVICES=0 python sample.py \
-  --sd_ckpt "black-forest-labs/FLUX.2-klein-4B" \
+  --sd_ckpt "black-forest-labs/FLUX.1-schnell" \
   --mode "original,edit" \
   --erase_type "instance" \
   --total_timesteps 4 \
   --num_samples 2 \
   --batch_size 2 \
-  --target_concept "Snoopy" \
-  --contents "Snoopy" \
-  --edit_ckpt "logs/checkpoints/Snoopy_cat_.safetensors" \
-  --save_root "logs/mlp" 
+  --target_concept "Mickey" \
+  --contents "Mickey" \
+  --edit_ckpt "logs/checkpoints/animal_nul.safetensors" \
+  --save_root "logs/mlp_memit" 
