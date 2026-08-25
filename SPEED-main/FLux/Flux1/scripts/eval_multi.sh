@@ -6,18 +6,17 @@ declare -A anchors_map
 declare -A contents_map
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # ========== Input Params ==========
-SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.2-klein-4B}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-FLux/logs/checkpoints}"
-SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-FLux/logs/FLUX}"
+SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.1-dev}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-logs/checkpoints}"
+SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-logs/FLUX1_DEV}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-PARAMS="${PARAMS:-V}"
-TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-10}"
-THRESHOLD="${THRESHOLD:-1e-4}"
-UPDATE_LAMBDA="${UPDATE_LAMBDA:-1e-2}"
+TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-20}"
+THRESHOLD="${THRESHOLD:-5e-2}"
+UPDATE_LAMBDA="${UPDATE_LAMBDA:-0.1}"
 MODE="${MODE:-edit}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
@@ -97,28 +96,27 @@ run_task() {
   anchor_name="${anchor:-null}"
   anchor_name="${anchor_name//, /_}"
   anchor_name="${anchor_name// /_}"
-  run_name="${erase_type}_${limited_target}_to_${anchor_name}_${PARAMS}_fixed_t${TRACE_NUM_STEPS}_thr${THRESHOLD}"
+  run_name="${erase_type}_${limited_target}_to_${anchor_name}_mlp_flux1dev_t${TRACE_NUM_STEPS}_thr${THRESHOLD}"
   ckpt_path="${CHECKPOINT_DIR}/${run_name}.safetensors"
   target_root="${save_root}/${erase_type}"
   contents="${contents_map[$erase_type]}"
 
-  echo "FLUX: editing [${erase_type}] [${limited_target} -> ${anchor}] on GPU [${gpu_id}] with [params=${PARAMS}, trace_steps=${TRACE_NUM_STEPS}, threshold=${THRESHOLD}]"
-  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/CE_Flux.py \
+  echo "FLUX.1-dev MLP: editing [${erase_type}] [${limited_target} -> ${anchor}] on GPU [${gpu_id}] with [trace_steps=${TRACE_NUM_STEPS}, threshold=${THRESHOLD}]"
+  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" mlp.py \
     --sd_ckpt "${SD_CKPT}" \
     --device "cuda:0" \
     --target_concepts "${target}" \
     --anchor_concepts "${anchor}" \
-    --retain_path "FLux/data/${erase_type}.csv" \
+    --retain_path "../data/${erase_type}.csv" \
     --heads "concept" \
     --save_path "${CHECKPOINT_DIR}" \
     --file_name "${run_name}" \
-    --params "${PARAMS}" \
     --trace_num_steps "${TRACE_NUM_STEPS}" \
     --threshold "${THRESHOLD}" \
     --update_lambda "${UPDATE_LAMBDA}"
 
   sample_args=(
-    "${PYTHON_BIN}" FLux/sample2.py
+    "${PYTHON_BIN}" sample2.py
     --sd_ckpt "${SD_CKPT}"
     --device "cuda:0"
     --erase_type "${erase_type}"
@@ -129,7 +127,7 @@ run_task() {
     --batch_size "${BATCH_SIZE}"
     --save_root "${target_root}"
     --edit_ckpt "${ckpt_path}"
-    --dataset_path "FLux/data/${erase_type}.csv"
+    --dataset_path "../data/${erase_type}.csv"
     --total_timesteps "${TOTAL_TIMESTEPS}"
     --guidance_scale "${GUIDANCE_SCALE}"
   )
@@ -153,11 +151,11 @@ run_task() {
   fi
 
   if [[ "${RUN_SCORE}" == "1" ]]; then
-    CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/score_cal.py \
+    CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" ../score_cal.py \
       --contents "${contents}" \
       --root_path "${target_root}" \
       --sub_root "edit" \
-      --pretrained_path "FLux/data/pretrain/${erase_type}"
+      --pretrained_path "../data/pretrain/${erase_type}"
   fi
 }
 

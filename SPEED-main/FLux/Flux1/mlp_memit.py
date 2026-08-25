@@ -1,13 +1,15 @@
 import os, re
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import time
 import torch
 import argparse
 import pandas as pd
 from safetensors.torch import save_file
-from diffusers import Flux2KleinPipeline
+from diffusers import DiffusionPipeline
 
-FLUX2_MLP_SUFFIX = ".ff_context.linear_out"
+FLUX1_MLP_SUFFIX = ".ff_context.net.2"
+FLUX1_MAX_SEQUENCE_LENGTH = 256
+
 
 def _trace_concepts(pipeline, concepts, token_indices, module_names, args, device, max_sequence_length):
     module_lookup = dict(pipeline.transformer.named_modules())
@@ -45,7 +47,7 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
                     prompt=concept_batch,
                     generator=generators,
                     num_inference_steps=args.trace_num_steps,
-                    guidance_scale=3.5,
+                    guidance_scale=args.trace_guidance_scale,
                     height=args.trace_resolution,
                     width=args.trace_resolution,
                     max_sequence_length=max_sequence_length,
@@ -56,12 +58,15 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
             for batch_index, concept in enumerate(concept_batch):
                 traces_by_concept[concept] = {
                     name: {
-                        kind: torch.stack(record[kind], dim=0)[:, batch_index, :, :].reshape(-1, torch.stack(record[kind], dim=0).shape[-1]).T
+                        kind: torch.stack(record[kind], dim=0)[:, batch_index, :, :].reshape(
+                            -1, torch.stack(record[kind], dim=0).shape[-1]
+                        ).T
                         for kind in ("inputs", "outputs")
                     }
                     for name, record in traces.items()
                 }
     return traces_by_concept
+
 
 def _closed_form_update(residual_target, target_target, update_lambda, retain_inputs, retain_threshold):
     retain_inputs = retain_inputs.to(device=target_target.device, dtype=target_target.dtype)
@@ -74,62 +79,38 @@ def _closed_form_update(residual_target, target_target, update_lambda, retain_in
     return torch.linalg.solve(system.T, (residual_target @ projector).T).T
 
 
-def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512):
+def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=FLUX1_MAX_SEQUENCE_LENGTH):
     edit_modules = []
     for name, module in pipeline.transformer.named_modules():
         match = re.match(r"transformer_blocks\.(\d+)\.", name)
-        if match is None or not name.endswith(FLUX2_MLP_SUFFIX) or not hasattr(module, "weight") or module.weight is None:
+        if match is None or not name.endswith(FLUX1_MLP_SUFFIX) or not hasattr(module, "weight") or module.weight is None:
             continue
         edit_modules.append((name, module))
     if not edit_modules:
-        raise RuntimeError("No Flux2 text MLP modules found: expected transformer_blocks.*.ff_context.linear_out")
+        raise RuntimeError("No Flux1 text MLP modules found: expected transformer_blocks.*.ff_context.net.2")
     module_names = [name for name, _ in edit_modules]
     final_module_name = module_names[-1]
     remaining_counts = {name: len(module_names) - index for index, name in enumerate(module_names)}
 
     non_empty_concepts = [
-        concept
-        for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts)
+        concept for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts)
         if concept != ""
     ]
     concept_token_indices = {}
-    concept_all_token_indices = {}
     for concept in non_empty_concepts:
-        text = pipeline.tokenizer.apply_chat_template(
-            [{"role": "user", "content": concept}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        suffix_text = text.split(concept, 1)[1]
-        suffix_length = int(pipeline.tokenizer(
-            suffix_text,
-            add_special_tokens=False,
-            return_tensors="pt",
-        ).attention_mask[0].sum().item())
-        full_length = int(pipeline.tokenizer(
-            text,
+        token_inputs = pipeline.tokenizer_2(
+            concept,
             padding="max_length",
             max_length=max_sequence_length,
             truncation=True,
             return_tensors="pt",
-        ).attention_mask[0].sum().item())
-        token_index = full_length - suffix_length - 1
-        if token_index < 0:
-            raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
+        )
+        token_index = int(token_inputs.attention_mask[0].sum().item()) - 2
         concept_token_indices[concept] = [token_index]
-        concept_all_token_indices[concept] = list(range(1, full_length)) or [token_index]
 
-    use_nudity_all_tokens = target_concepts == ["nudity"]
-    nudity_token_indices = concept_all_token_indices["nudity"] if use_nudity_all_tokens else None
-    if use_nudity_all_tokens:
-        print(f"nudity all-token trace positions: {nudity_token_indices}")
-    target_token_indices = {
-        concept: nudity_token_indices if use_nudity_all_tokens else concept_token_indices[concept]
-        for concept in target_concepts
-    }
+    target_token_indices = {concept: concept_token_indices[concept] for concept in target_concepts}
     anchor_token_indices = {
-        concept: nudity_token_indices if use_nudity_all_tokens else ([0] if concept == "" else concept_token_indices[concept])
+        concept: [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
     retain_token_indices = {
@@ -137,15 +118,24 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         for concept in retain_texts
     }
 
-    anchor_final_traces = _trace_concepts(pipeline, anchor_concepts, anchor_token_indices, [final_module_name], args, device, max_sequence_length)
+    anchor_final_traces = _trace_concepts(
+        pipeline, anchor_concepts, anchor_token_indices, [final_module_name], args, device, max_sequence_length
+    )
     retain_inputs_by_module = {module_name: [] for module_name in module_names}
     for start in range(0, len(retain_texts), args.chunk_size):
         retain_chunk = retain_texts[start:start + args.chunk_size]
-        retain_traces = _trace_concepts(pipeline, retain_chunk, retain_token_indices, module_names, args, device, max_sequence_length)
+        retain_traces = _trace_concepts(
+            pipeline, retain_chunk, retain_token_indices, module_names, args, device, max_sequence_length
+        )
         for module_name in module_names:
-            inputs = [retain_traces[concept][module_name]["inputs"] for concept in retain_chunk if concept in retain_traces]
+            inputs = [
+                retain_traces[concept][module_name]["inputs"]
+                for concept in retain_chunk
+                if concept in retain_traces and module_name in retain_traces[concept]
+            ]
             if inputs:
                 retain_inputs_by_module[module_name].append(torch.cat(inputs, dim=1))
+        del retain_traces
     for module_name in module_names:
         if not retain_inputs_by_module[module_name]:
             raise RuntimeError(f"No retain trace for {module_name}")
@@ -154,16 +144,24 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     edit_dict = {}
     for module_name, module in edit_modules:
         trace_names = [module_name] if module_name == final_module_name else [module_name, final_module_name]
-        target_traces = _trace_concepts(pipeline, target_concepts, target_token_indices, trace_names, args, device, max_sequence_length)
+        target_traces = _trace_concepts(
+            pipeline, target_concepts, target_token_indices, trace_names, args, device, max_sequence_length
+        )
         target_inputs, residuals = [], []
         for concept, anchor_concept in zip(target_concepts, anchor_concepts):
             current_final = target_traces[concept][final_module_name]["outputs"]
-            anchor_final = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(current_final.device, current_final.dtype)
+            anchor_final = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(
+                current_final.device, current_final.dtype
+            )
             target_inputs.append(target_traces[concept][module_name]["inputs"])
-            residuals.append((anchor_final - current_final) / remaining_counts[module_name])
+            residuals.append(
+                args.residual_scale * (anchor_final - current_final) / remaining_counts[module_name]
+            )
 
         target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
-        residual_target = torch.stack([residual @ target.T for target, residual in zip(target_inputs, residuals)]).mean(0)
+        residual_target = torch.stack([
+            residual @ target.T for target, residual in zip(target_inputs, residuals)
+        ]).mean(0)
         delta = _closed_form_update(
             residual_target.to(module.weight.device, torch.float32),
             target_target.to(module.weight.device, torch.float32),
@@ -178,7 +176,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.2-klein-4B")
+    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--file_name", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
@@ -189,36 +187,28 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=128)
     parser.add_argument("--trace_batch_size", type=int, default=4)
     parser.add_argument("--threshold", type=float, default=3e-2)
-    parser.add_argument("--trace_num_steps", type=int, default=20)
+    parser.add_argument("--trace_num_steps", type=int, default=4)
+    parser.add_argument("--trace_guidance_scale", type=float, default=0.0)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
-    parser.add_argument("--update_lambda", type=float, default=1)
+    parser.add_argument("--update_lambda", type=float, default=1.0)
+    parser.add_argument("--residual_scale", type=float, default=1.0)
+    parser.add_argument("--max_sequence_length", type=int, default=FLUX1_MAX_SEQUENCE_LENGTH)
     args = parser.parse_args()
 
     target_concepts = [con.strip() for con in args.target_concepts.split(",")]
-    if not target_concepts or any(concept == "" for concept in target_concepts):
-        raise ValueError("--target_concepts must not contain empty concepts")
-    anchor_concepts = args.anchor_concepts
-    retain_path = args.retain_path
-
-    file_suffix = "_".join(target_concepts[:5]) + f"_{len(target_concepts)}-mlp-memit"
-    anchor_concepts = [x.strip() for x in anchor_concepts.split(",")]
+    anchor_concepts = [con.strip() for con in args.anchor_concepts.split(",")]
     if len(anchor_concepts) == 1:
         anchor_concepts = anchor_concepts * len(target_concepts)
-        if anchor_concepts[0] == "":
-            file_suffix += "-to_null"
-        else:
-            file_suffix += f"-to_{anchor_concepts[0]}"
     else:
         assert len(target_concepts) == len(anchor_concepts)
-        file_suffix += f'-to_{anchor_concepts[0]}_etc'
 
     retain_texts = []
-    if retain_path is not None:
-        assert retain_path.endswith('.csv')
-        df = pd.read_csv(retain_path)
-        for head in args.heads.split(','):
-            retain_texts += df[head.strip()].unique().tolist()
+    if args.retain_path is not None:
+        assert args.retain_path.endswith(".csv")
+        dataframe = pd.read_csv(args.retain_path)
+        for head in args.heads.split(","):
+            retain_texts += dataframe[head.strip()].unique().tolist()
     else:
         retain_texts.append("")
     retain_texts = [
@@ -226,10 +216,14 @@ if __name__ == "__main__":
         if not any(re.search(r"\b" + re.escape(concept.lower()) + r"\b", text.lower()) for concept in target_concepts)
     ]
 
-    pipeline = Flux2KleinPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
+    file_suffix = "_".join(target_concepts[:5]) + f"_{len(target_concepts)}-mlp-memit"
+    file_suffix += "-to_null" if anchor_concepts[0] == "" else f"-to_{anchor_concepts[0]}"
+    pipeline = DiffusionPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
-    edit_dict = edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, args.device)
+    edit_dict = edit_model(
+        args, pipeline, target_concepts, anchor_concepts, retain_texts, args.device, args.max_sequence_length
+    )
     save_path = args.save_path or "logs/checkpoints"
     file_name = args.file_name or f"{time.strftime('%Y%m%d-%H%M%S')}-{file_suffix}"
     os.makedirs(save_path, exist_ok=True)

@@ -51,7 +51,11 @@ def evaluation(path, subfolder, threshold):
     providers = ["CUDAExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
     nude_detector = NudeDetector(inference_resolution=320, providers=providers)
 
-    image_root = os.path.join(path, "nudity", subfolder)
+    direct_image_root = os.path.join(path, subfolder)
+    if os.path.isdir(direct_image_root):
+        image_root = direct_image_root
+    else:
+        image_root = os.path.join(path, "nudity", subfolder)
     img_names = [name for name in os.listdir(image_root) if name.lower().endswith((".png", ".jpg", ".jpeg"))]
     image_paths = [
         os.path.join(image_root, name)
@@ -112,4 +116,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

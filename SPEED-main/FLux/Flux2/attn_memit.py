@@ -98,22 +98,43 @@ def _closed_form_update(residual_target, target_target, update_lambda, retain_in
 
 
 def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512):
-    selected_suffixes = [ATTENTION_SUFFIXES[param] for param in args.params]
+    selected_params = list(args.params)
     edit_modules = []
     for name, module in pipeline.transformer.named_modules():
-        if hasattr(module, "weight") and module.weight is not None and any(suffix in name for suffix in selected_suffixes):
-            match = re.match(r"transformer_blocks\.(\d+)\.", name)
-            if match is not None:
-                edit_modules.append((name, module, next(suffix for suffix in selected_suffixes if suffix in name)))
+        if not hasattr(module, "weight") or module.weight is None:
+            continue
+        match = re.match(r"transformer_blocks\.(\d+)\.", name)
+        if match is None:
+            continue
+        matched_params = [
+            param
+            for param in selected_params
+            if name.endswith(ATTENTION_SUFFIXES[param])
+        ]
+        if matched_params:
+            edit_modules.append((name, module, matched_params[0]))
     if not edit_modules:
         raise RuntimeError(f"No text-side attention modules selected for params={args.params}")
     module_names = [name for name, _, _ in edit_modules]
     grouped_modules = {}
-    for module_name, module, suffix in edit_modules:
+    modules_by_param = {param: [] for param in selected_params}
+    for module_name, module, param in edit_modules:
         layer_index = int(re.match(r"transformer_blocks\.(\d+)\.", module_name).group(1))
-        grouped_modules.setdefault(layer_index, []).append((module_name, module, suffix))
-    final_module_name = module_names[-1]
-    remaining_counts = {name: len(module_names) - index for index, name in enumerate(module_names)}
+        grouped_modules.setdefault(layer_index, []).append((module_name, module, param))
+        modules_by_param[param].append((module_name, module))
+    final_module_by_param = {
+        param: modules[-1][0]
+        for param, modules in modules_by_param.items()
+        if modules
+    }
+    remaining_counts_by_param = {
+        param: {
+            module_name: len(modules) - index
+            for index, (module_name, _module) in enumerate(modules)
+        }
+        for param, modules in modules_by_param.items()
+        if modules
+    }
 
     non_empty_concepts = [
         concept
@@ -163,7 +184,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         pipeline,
         anchor_concepts,
         anchor_token_indices,
-        [final_module_name],
+        list(final_module_by_param.values()),
         args,
         device,
         max_sequence_length,
@@ -205,10 +226,10 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
 
     edit_dict = {}
     for _layer_index, layer_modules in sorted(grouped_modules.items()):
-        layer_module_names = [module_name for module_name, _module, _suffix in layer_modules]
         layer_total = len(target_concepts) + len(layer_modules)
         with tqdm(total=layer_total, desc=f"layer {_layer_index}", dynamic_ncols=True, leave=False) as layer_pbar:
-            for module_name, module, suffix in layer_modules:
+            for module_name, module, param in layer_modules:
+                final_module_name = final_module_by_param[param]
                 trace_names = [module_name] if module_name == final_module_name else [module_name, final_module_name]
                 target_traces = _trace_concepts(
                     pipeline,
@@ -225,7 +246,11 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                     current_final = concept_trace[final_module_name]["outputs"]
                     anchor_final = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(current_final.device, current_final.dtype)
                     target_inputs.append(concept_trace[module_name]["inputs"])
-                    residuals.append((anchor_final - current_final) / remaining_counts[module_name])
+                    residuals.append(
+                        args.residual_scale
+                        * (anchor_final - current_final)
+                        / remaining_counts_by_param[param][module_name]
+                    )
 
                 target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
                 residual_target = torch.stack([residual @ target.T for target, residual in zip(target_inputs, residuals)]).mean(0)

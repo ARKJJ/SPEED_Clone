@@ -38,20 +38,40 @@ def load_flux_pipeline(model_id, device, torch_dtype):
     return pipe
 
 
-def flux_generate(pipe, prompt, seeds, args, desc=None):
-    images = []
+def prepare_shared_latents(pipe, seeds, args):
+    channels = pipe.transformer.config.in_channels // 4
+    latents = {}
     for seed in seeds:
-        generator = torch.Generator(device=pipe.device).manual_seed(seed)
-        result = pipe(
-            prompt=prompt,
-            generator=generator,
-            num_inference_steps=args.total_timesteps,
-            guidance_scale=args.guidance_scale,
+        prepared = pipe.prepare_latents(
+            batch_size=1,
+            num_channels_latents=channels,
             height=args.height,
             width=args.width,
-            max_sequence_length=args.max_sequence_length,
+            dtype=pipe.transformer.dtype,
+            device=pipe.device,
+            generator=torch.Generator(device=pipe.device).manual_seed(seed),
+            latents=None,
         )
-        images.append(result.images[0])
+        latents[seed] = (prepared[0] if isinstance(prepared, tuple) else prepared).clone()
+    return latents
+
+
+def flux_generate(pipe, prompt, seeds, args, desc=None, latents_by_seed=None):
+    images = []
+    kwargs = dict(
+        prompt=prompt,
+        num_inference_steps=args.total_timesteps,
+        guidance_scale=args.guidance_scale,
+        height=args.height,
+        width=args.width,
+        max_sequence_length=args.max_sequence_length,
+    )
+    for seed in seeds:
+        if latents_by_seed is None:
+            kwargs["generator"] = torch.Generator(device=pipe.device).manual_seed(seed)
+        else:
+            kwargs["latents"] = latents_by_seed[seed].clone()
+        images.append(pipe(**kwargs).images[0])
     if desc is not None:
         print(f"{desc}: generated {len(images)} images")
     return images
@@ -166,39 +186,34 @@ def main():
         prompt_list = [[x.format(concept) for x in args.prompts.split(";") if x.strip()] for concept in concept_list]
 
     bs = args.batch_size
+    paired = "original" in mode_list and "edit" in mode_list
     for i in range((args.num_samples + bs - 1) // bs):
         start_idx = i * bs
         end_idx = min(start_idx + bs, args.num_samples)
         seeds = [args.seed + sample_idx for sample_idx in range(start_idx, end_idx)]
+        shared_latents = prepare_shared_latents(pipe, seeds, args) if paired else None
         for concept, prompts in zip(concept_list, prompt_list):
             for count, prompt in enumerate(prompts):
                 save_images = {}
 
-                if "original" in mode_list:
-                    save_images["original"] = flux_generate(
-                        pipe=pipe,
-                        prompt=prompt,
-                        seeds=seeds,
-                        args=args,
-                        desc=f"{count} x {prompt} | original",
-                    )
-                if "edit" in mode_list:
-                    save_images["edit"] = flux_generate(
-                        pipe=pipe_edit,
-                        prompt=prompt,
-                        seeds=seeds,
-                        args=args,
-                        desc=f"{count} x {prompt} | edit",
-                    )
+                for mode, current_pipe in (("original", pipe), ("edit", pipe_edit)):
+                    if mode in mode_list:
+                        save_images[mode] = flux_generate(
+                            current_pipe,
+                            prompt,
+                            seeds,
+                            args,
+                            desc=f"{count} x {prompt} | {mode}",
+                            latents_by_seed=shared_latents,
+                        )
 
                 save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), concept)
-                for mode in mode_list:
+                output_modes = mode_list + (["combine"] if len(mode_list) > 1 else [])
+                for mode in output_modes:
                     os.makedirs(os.path.join(save_path, mode), exist_ok=True)
-                if len(mode_list) > 1:
-                    os.makedirs(os.path.join(save_path, "combine"), exist_ok=True)
 
                 for idx in range(len(save_images[mode_list[0]])):
-                    save_filename = re.sub(r"[^\w\s]", "", prompt).replace(", ", "_") + f"_{int(idx + start_idx)}.png"
+                    save_filename = re.sub(r"[^\w\s]", "", prompt).replace(", ", "_") + f"_{idx + start_idx}.png"
                     images_to_combine = []
                     for mode in mode_list:
                         save_images[mode][idx].save(os.path.join(save_path, mode, save_filename))

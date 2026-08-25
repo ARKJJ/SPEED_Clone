@@ -46,20 +46,40 @@ def load_flux_pipeline(model_id, device, torch_dtype):
     return pipe
 
 
-def flux_generate(pipe, prompts, seeds, args, desc=None):
+def prepare_shared_latents(pipe, seeds, args):
+    channels = pipe.transformer.config.in_channels // 4
+    latents = {}
+    for seed in seeds:
+        prepared = pipe.prepare_latents(
+            batch_size=1,
+            num_channels_latents=channels,
+            height=args.height,
+            width=args.width,
+            dtype=pipe.transformer.dtype,
+            device=pipe.device,
+            generator=torch.Generator(device=pipe.device).manual_seed(seed),
+            latents=None,
+        )
+        latents[seed] = (prepared[0] if isinstance(prepared, tuple) else prepared).clone()
+    return latents
+
+
+def flux_generate(pipe, prompts, seeds, args, desc=None, latents_by_seed=None):
     images = []
     for prompt, seed in zip(prompts, seeds):
-        generator = torch.Generator(device=pipe.device).manual_seed(int(seed))
-        image = pipe(
+        kwargs = dict(
             prompt=prompt,
-            generator=generator,
             num_inference_steps=args.total_timesteps,
             guidance_scale=args.guidance_scale,
             height=args.height,
             width=args.width,
             max_sequence_length=args.max_sequence_length,
-        ).images[0]
-        images.append(image)
+        )
+        if latents_by_seed is None:
+            kwargs["generator"] = torch.Generator(device=pipe.device).manual_seed(int(seed))
+        else:
+            kwargs["latents"] = latents_by_seed[int(seed)].clone()
+        images.append(pipe(**kwargs).images[0])
     if desc is not None:
         print(f"{desc}: generated {len(images)} images")
     return images
@@ -177,6 +197,8 @@ def main():
             seeds = [int(x) for x in data["seed"]]
             filenames = list(data["filename"])
             save_images = {}
+            paired = "original" in mode_list and "edit" in mode_list
+            shared_latents = prepare_shared_latents(pipe, seeds, args) if paired else None
 
             if "original" in mode_list:
                 save_images["original"] = flux_generate(
@@ -185,6 +207,7 @@ def main():
                     seeds=seeds,
                     args=args,
                     desc=f"{count * len(prompts)} x prompts | original",
+                    latents_by_seed=shared_latents,
                 )
             if "edit" in mode_list:
                 save_images["edit"] = flux_generate(
@@ -193,6 +216,7 @@ def main():
                     seeds=seeds,
                     args=args,
                     desc=f"{count * len(prompts)} x prompts | edit",
+                    latents_by_seed=shared_latents,
                 )
 
             save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), content)

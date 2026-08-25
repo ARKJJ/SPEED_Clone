@@ -59,6 +59,12 @@ def flux_generate(pipe, prompts, seeds, args, desc=None):
     return images
 
 
+def expected_count_for_content(content, args):
+    if content in ["nudity", "coco", "erase", "retain"]:
+        return len(AdaDataset(content=content, args=args))
+    return len(template_dict[args.erase_type]) * args.num_samples
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -116,7 +122,7 @@ def main():
                 "edit",
             )
             os.makedirs(check_path, exist_ok=True)
-            if len(os.listdir(check_path)) != len(template_dict[args.erase_type]) * 10:
+            if len(os.listdir(check_path)) != expected_count_for_content(content, args):
                 sampled_contents.append(content)
         contents = sampled_contents
         if not contents:

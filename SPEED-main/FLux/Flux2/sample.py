@@ -10,7 +10,7 @@ from PIL import Image
 import random
 import torch
 import numpy as np
-from diffusers import DiffusionPipeline  
+from diffusers import Flux2KleinPipeline
 from diffusers.utils import logging as diffusers_logging
 from safetensors.torch import load_file  
 from template import template_dict  
@@ -28,7 +28,8 @@ def seed_everything(seed, deterministic=False):
         torch.backends.cudnn.benchmark = False
 
 def load_flux_pipeline(model_id, device, torch_dtype):  
-    pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)  
+    pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
+    print(f"Loaded Flux2 pipeline: {type(pipe).__name__} | model_id={model_id}")
     pipe.vae.enable_slicing() 
     pipe.vae.enable_tiling() 
     return pipe 

@@ -4,18 +4,16 @@ import time
 import torch
 import argparse
 import pandas as pd
-from tqdm import tqdm
-from diffusers.utils import logging as diffusers_logging
 from safetensors.torch import save_file
 from diffusers import DiffusionPipeline
 
-ATTENTION_SUFFIXES = {"Q": ".attn.add_q_proj", "K": ".attn.add_k_proj", "V": ".attn.add_v_proj"}
+FLUX1_MLP_SUFFIX = ".ff_context.net.2"
 
 
-def _trace_concepts(pipeline,concepts,token_indices, module_names, args, device,max_sequence_length, progress_bar=None):
+def _trace_concepts(pipeline, concepts, token_indices, module_names, args, device, max_sequence_length):
     module_lookup = dict(pipeline.transformer.named_modules())
     traced_concepts = {}
-    trace_batch_size = max(1, args.trace_batch_size)
+    trace_batch_size = max(1, int(getattr(args, "trace_batch_size", 1)))
     grouped_concepts = {}
 
     for concept in dict.fromkeys(concepts):
@@ -48,7 +46,7 @@ def _trace_concepts(pipeline,concepts,token_indices, module_names, args, device,
                     prompt=concept_batch,
                     generator=generators,
                     num_inference_steps=args.trace_num_steps,
-                    guidance_scale=args.trace_guidance_scale,
+                    guidance_scale=3.5,
                     height=args.trace_resolution,
                     width=args.trace_resolution,
                     max_sequence_length=max_sequence_length,
@@ -65,40 +63,44 @@ def _trace_concepts(pipeline,concepts,token_indices, module_names, args, device,
                         "inputs": input_steps[:, batch_index, :, :].reshape(-1, input_steps.shape[-1]).T,
                     }
                 traced_concepts[concept] = compact
-            if progress_bar is not None:
-                progress_bar.update(len(concept_batch))
     return traced_concepts
 
 
 def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
-    eye = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
     retain_inputs = retain_inputs.to(device=sum_target_target.device, dtype=sum_target_target.dtype)
     covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
     U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
     null_basis = U[:, S < retain_threshold]
     if null_basis.shape[1] == 0:
-        projector = eye
+        projector = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
     else:
         projector = null_basis @ null_basis.T
-    delta = weight @ (sum_target_anchor - sum_target_target) @ projector @ (sum_target_target @ projector + update_lambda * eye).inverse()
+    eye = torch.eye(sum_target_target.shape[0], device=sum_target_target.device, dtype=sum_target_target.dtype)
+    system = sum_target_target @ projector + update_lambda * eye
+    residual_projection = weight @ (sum_target_anchor - sum_target_target) @ projector
+    delta = torch.linalg.solve(system.T, residual_projection.T).T
     return delta
 
 
 def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=256,):
-    selected_suffixes = [ATTENTION_SUFFIXES[param] for param in args.params]
     edit_modules = []
     for name, module in pipeline.transformer.named_modules():
-        if hasattr(module, "weight") and module.weight is not None and any(suffix in name for suffix in selected_suffixes):
-            match = re.match(r"transformer_blocks\.(\d+)\.", name)
-            if match is not None:
-                edit_modules.append((name, module))
+        if not hasattr(module, "weight") or module.weight is None:
+            continue
+        if not name.endswith(FLUX1_MLP_SUFFIX):
+            continue
+        if re.match(r"transformer_blocks\.(\d+)\.", name) is None:
+            continue
+        edit_modules.append((name, module))
     if not edit_modules:
-        raise RuntimeError(f"No text-side attention modules selected for params={args.params}")
+        raise RuntimeError("No Flux1 text MLP modules found: expected transformer_blocks.*.ff_context.net.2")
     module_names = [name for name, _ in edit_modules]
     grouped_modules = {}
     for module_name, module in edit_modules:
-        layer_index = int(re.match(r"transformer_blocks\.(\d+)\.", module_name).group(1))
-        grouped_modules.setdefault(layer_index, []).append((module_name, module))
+        match = re.match(r"transformer_blocks\.(\d+)\.", module_name)
+        if match is None:
+            continue
+        grouped_modules.setdefault(int(match.group(1)), []).append((module_name, module))
 
     non_empty_concepts = [
         concept
@@ -127,45 +129,34 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         concept: [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
-    for concept in target_concepts:
-        print(f"target {concept}: {target_token_indices[concept]}")
-    for concept in anchor_concepts:
-        print(f"anchor {concept}: {anchor_token_indices[concept]}")
     retain_token_indices = {
         concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
         for concept in retain_texts
     }
 
-    anchor_base_traces = _trace_concepts(pipeline,anchor_concepts,anchor_token_indices,module_names,args,device,max_sequence_length)
+    anchor_base_traces = _trace_concepts(
+        pipeline,
+        anchor_concepts,
+        anchor_token_indices,
+        module_names,
+        args,
+        device,
+        max_sequence_length,
+    )
 
     retain_inputs_by_module = {module_name: [] for module_name in module_names}
-    retain_total = sum(
-        1
-        for concept in retain_texts
-        if retain_token_indices.get(concept)
-    )
-    with tqdm(total=retain_total, desc="retain trace", dynamic_ncols=True, leave=True) as retain_pbar:
-        for j in range(0, len(retain_texts), args.chunk_size):
-            retain_chunk = retain_texts[j:j + args.chunk_size]
-            retain_traces = _trace_concepts(
-                pipeline,
-                retain_chunk,
-                retain_token_indices,
-                module_names,
-                args,
-                device,
-                max_sequence_length,
-                progress_bar=retain_pbar
-            )
-            for module_name in module_names:
-                retain_inputs = [
-                    retain_traces[concept][module_name]["inputs"]
-                    for concept in retain_chunk
-                    if concept in retain_traces and module_name in retain_traces[concept]
-                ]
-                if retain_inputs:
-                    retain_inputs_by_module[module_name].append(torch.cat(retain_inputs, dim=1))
-            del retain_traces
+    for j in range(0, len(retain_texts), args.chunk_size):
+        retain_chunk = retain_texts[j:j + args.chunk_size]
+        retain_traces = _trace_concepts(pipeline, retain_chunk, retain_token_indices, module_names, args, device, max_sequence_length)
+        for module_name in module_names:
+            retain_inputs = [
+                retain_traces[concept][module_name]["inputs"]
+                for concept in retain_chunk
+                if concept in retain_traces and module_name in retain_traces[concept]
+            ]
+            if retain_inputs:
+                retain_inputs_by_module[module_name].append(torch.cat(retain_inputs, dim=1))
+        del retain_traces
     for module_name in module_names:
         if not retain_inputs_by_module[module_name]:
             raise RuntimeError(f"No retain trace for {module_name}")
@@ -174,49 +165,38 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     edit_dict = {}
     for _layer_index, layer_modules in sorted(grouped_modules.items()):
         layer_module_names = [module_name for module_name, _module in layer_modules]
-        layer_total = len(target_concepts) + len(layer_modules)
-        with tqdm(total=layer_total, desc=f"layer {_layer_index}", dynamic_ncols=True, leave=False) as layer_pbar:
-            layer_target_traces = _trace_concepts(
-                pipeline,
-                target_concepts,
-                target_token_indices,
-                layer_module_names,
-                args,
-                device,
-                max_sequence_length,
-                progress_bar=layer_pbar
+        layer_target_traces = _trace_concepts(pipeline, target_concepts, target_token_indices, layer_module_names, args, device, max_sequence_length)
+        for module_name, module in layer_modules:
+            target_inputs, anchor_inputs = [], []
+            for concept, anchor_concept in zip(target_concepts, anchor_concepts):
+                concept_trace = layer_target_traces[concept]
+                target_inputs.append(concept_trace[module_name]["inputs"])
+                anchor_inputs.append(anchor_base_traces[anchor_concept][module_name]["inputs"])
+
+            sum_target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
+            sum_target_anchor = torch.stack([anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]).mean(0)
+            sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
+            sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
+            retain_inputs = retain_inputs_by_module[module_name]
+
+            weight_before = module.weight.float()
+            delta = _closed_form_update(
+                sum_target_anchor,
+                sum_target_target,
+                weight_before,
+                args.update_lambda,
+                retain_inputs.to(module.weight.device, torch.float32),
+                args.threshold,
             )
-            for module_name, module in layer_modules:
-                sum_target_target, sum_target_anchor = [], []
-                for concept, anchor_concept in zip(target_concepts, anchor_concepts):
-                    concept_trace = layer_target_traces[concept]
-                    target_inputs = concept_trace[module_name]["inputs"]
-                    anchor_inputs = anchor_base_traces[anchor_concept][module_name]["inputs"]
-                    sum_target_target.append(target_inputs @ target_inputs.T)
-                    sum_target_anchor.append(anchor_inputs @ target_inputs.T)
+            module.weight = torch.nn.Parameter(weight_before.add(delta).to(module.weight.dtype))
+            edit_dict[module_name + ".weight"] = module.weight.detach().clone()
 
-                sum_target_target = torch.stack(sum_target_target).mean(0).to(module.weight.device, torch.float32)
-                sum_target_anchor = torch.stack(sum_target_anchor).mean(0).to(module.weight.device, torch.float32)
-                retain_inputs = retain_inputs_by_module[module_name]
-
-                weight_before = module.weight.float()
-                delta = _closed_form_update(
-                    sum_target_anchor,
-                    sum_target_target,
-                    weight_before,
-                    args.update_lambda,
-                    retain_inputs.to(module.weight.device, torch.float32),
-                    args.threshold,
-                )
-                module.weight = torch.nn.Parameter(weight_before.add(delta).to(module.weight.dtype))
-                edit_dict[module_name + ".weight"] = module.weight.detach().clone()
-                layer_pbar.update(1)
     return edit_dict
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.1-schnell")
+    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--file_name", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
@@ -226,17 +206,12 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=str, default=None)
     parser.add_argument("--chunk_size", type=int, default=128)
     parser.add_argument("--trace_batch_size", type=int, default=4)
-    parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
-    parser.add_argument("--threshold", type=float, default=1e-1)
-    parser.add_argument("--trace_num_steps", type=int, default=4)
-    parser.add_argument("--trace_guidance_scale", type=float, default=0.0)
+    parser.add_argument("--threshold", type=float, default=3e-2)
+    parser.add_argument("--trace_num_steps", type=int, default=20)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
-    parser.add_argument("--update_lambda", type=float, default=0.1)
+    parser.add_argument("--update_lambda", type=float, default=1)
     args = parser.parse_args()
-
-    diffusers_logging.set_verbosity_error()
-    diffusers_logging.disable_progress_bar()
 
     target_concepts = [con.strip() for con in args.target_concepts.split(",")]
     if not target_concepts or any(concept == "" for concept in target_concepts):
@@ -244,7 +219,7 @@ if __name__ == "__main__":
     anchor_concepts = args.anchor_concepts
     retain_path = args.retain_path
 
-    file_suffix = "_".join(target_concepts[:5]) + f"_{len(target_concepts)}"
+    file_suffix = "_".join(target_concepts[:5]) + f"_{len(target_concepts)}-mlp2"
     anchor_concepts = [x.strip() for x in anchor_concepts.split(",")]
     if len(anchor_concepts) == 1:
         anchor_concepts = anchor_concepts * len(target_concepts)
@@ -272,7 +247,6 @@ if __name__ == "__main__":
     pipeline = DiffusionPipeline.from_pretrained(args.sd_ckpt, torch_dtype=torch.bfloat16).to(args.device)
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
-    pipeline.set_progress_bar_config(disable=True)
     edit_dict = edit_model(
         args=args,
         pipeline=pipeline,
@@ -280,7 +254,7 @@ if __name__ == "__main__":
         anchor_concepts=anchor_concepts,
         retain_texts=retain_texts,
         device=args.device,
-        max_sequence_length=256,
+        max_sequence_length=512,
     )
 
     save_path = args.save_path or "logs/checkpoints"
