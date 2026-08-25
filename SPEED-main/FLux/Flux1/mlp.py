@@ -116,21 +116,22 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             truncation=True,
             return_tensors="pt",
         )
-        token_index = int(token_inputs.attention_mask[0].sum().item()) - 2
-        if token_index < 0:
+        valid_token_count = int(token_inputs.attention_mask[0].sum().item())
+        content_indices = list(range(valid_token_count - 1))
+        if not content_indices:
             raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
-        concept_token_indices[concept] = [token_index]
+        concept_token_indices[concept] = content_indices
 
     target_token_indices = {
         concept: concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: [0] if concept == "" else concept_token_indices[concept]
+        concept: [0] if concept == "" else [concept_token_indices[concept][-1]]
         for concept in anchor_concepts
     }
     retain_token_indices = {
-        concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
+        concept: list(range(1, max_sequence_length)) if concept == "" else [concept_token_indices[concept][-1]]
         for concept in retain_texts
     }
 
@@ -173,8 +174,20 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 target_inputs.append(concept_trace[module_name]["inputs"])
                 anchor_inputs.append(anchor_base_traces[anchor_concept][module_name]["inputs"])
 
-            sum_target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
-            sum_target_anchor = torch.stack([anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]).mean(0)
+            target_terms = []
+            cross_terms = []
+            for target, anchor in zip(target_inputs, anchor_inputs):
+                if target.shape[1] % anchor.shape[1] != 0:
+                    raise RuntimeError(
+                        f"Trace shape mismatch: target={target.shape}, anchor={anchor.shape}"
+                    )
+                target_count = target.shape[1] // anchor.shape[1]
+                anchor = anchor.repeat_interleave(target_count, dim=1)
+                target_terms.append(target @ target.T / target.shape[1])
+                cross_terms.append(anchor @ target.T / target.shape[1])
+
+            sum_target_target = torch.stack(target_terms).mean(0)
+            sum_target_anchor = torch.stack(cross_terms).mean(0)
             sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
             sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
             retain_inputs = retain_inputs_by_module[module_name]
@@ -210,7 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--trace_num_steps", type=int, default=20)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
-    parser.add_argument("--update_lambda", type=float, default=1)
+    parser.add_argument("--update_lambda", type=float, default=0.1)
     args = parser.parse_args()
 
     target_concepts = [con.strip() for con in args.target_concepts.split(",")]

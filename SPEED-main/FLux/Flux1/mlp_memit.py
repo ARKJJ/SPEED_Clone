@@ -105,16 +105,19 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             truncation=True,
             return_tensors="pt",
         )
-        token_index = int(token_inputs.attention_mask[0].sum().item()) - 2
-        concept_token_indices[concept] = [token_index]
+        valid_token_count = int(token_inputs.attention_mask[0].sum().item())
+        content_indices = list(range(valid_token_count - 1))
+        if not content_indices:
+            raise RuntimeError(f"No content token found for {concept!r}.")
+        concept_token_indices[concept] = content_indices
 
     target_token_indices = {concept: concept_token_indices[concept] for concept in target_concepts}
     anchor_token_indices = {
-        concept: [0] if concept == "" else concept_token_indices[concept]
+        concept: [0] if concept == "" else [concept_token_indices[concept][-1]]
         for concept in anchor_concepts
     }
     retain_token_indices = {
-        concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
+        concept: list(range(1, max_sequence_length)) if concept == "" else [concept_token_indices[concept][-1]]
         for concept in retain_texts
     }
 
@@ -153,14 +156,24 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             anchor_final = anchor_final_traces[anchor_concept][final_module_name]["outputs"].to(
                 current_final.device, current_final.dtype
             )
+            if current_final.shape[1] % anchor_final.shape[1] != 0:
+                raise RuntimeError(
+                    f"Trace shape mismatch: target={current_final.shape}, "
+                    f"anchor={anchor_final.shape}"
+                )
+            target_count = current_final.shape[1] // anchor_final.shape[1]
+            anchor_final = anchor_final.repeat_interleave(target_count, dim=1)
             target_inputs.append(target_traces[concept][module_name]["inputs"])
             residuals.append(
                 args.residual_scale * (anchor_final - current_final) / remaining_counts[module_name]
             )
 
-        target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
+        target_target = torch.stack([
+            target @ target.T / target.shape[1] for target in target_inputs
+        ]).mean(0)
         residual_target = torch.stack([
-            residual @ target.T for target, residual in zip(target_inputs, residuals)
+            residual @ target.T / target.shape[1]
+            for target, residual in zip(target_inputs, residuals)
         ]).mean(0)
         delta = _closed_form_update(
             residual_target.to(module.weight.device, torch.float32),
@@ -187,8 +200,8 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=128)
     parser.add_argument("--trace_batch_size", type=int, default=4)
     parser.add_argument("--threshold", type=float, default=3e-2)
-    parser.add_argument("--trace_num_steps", type=int, default=4)
-    parser.add_argument("--trace_guidance_scale", type=float, default=0.0)
+    parser.add_argument("--trace_num_steps", type=int, default=20)
+    parser.add_argument("--trace_guidance_scale", type=float, default=3.5)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=1.0)

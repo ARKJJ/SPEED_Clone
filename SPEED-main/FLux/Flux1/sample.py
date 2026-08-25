@@ -18,7 +18,7 @@ from safetensors.torch import load_file
 from template import template_dict
 
 
-DEFAULT_MAX_SEQUENCE_LENGTH = 256
+DEFAULT_MAX_SEQUENCE_LENGTH = 512
 
 
 def seed_everything(seed, deterministic=False):
@@ -114,14 +114,14 @@ def combine_images_horizontally(images):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_root", type=str, default="")
-    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.1-schnell")
+    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--model_id", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--mode", type=str, default="original", help="original, edit")
-    parser.add_argument("--guidance_scale", type=float, default=0.0)
-    parser.add_argument("--total_timesteps", type=int, default=4, help="The total timesteps of the sampling process")
+    parser.add_argument("--guidance_scale", type=float, default=3.5)
+    parser.add_argument("--total_timesteps", type=int, default=20, help="The total timesteps of the sampling process")
     parser.add_argument("--num_samples", type=int, default=10, help="The number of samples per prompt to generate")
     parser.add_argument("--batch_size", type=int, default=10, help="Kept for SPEED CLI compatibility")
     parser.add_argument("--prompts", type=str, default=None)

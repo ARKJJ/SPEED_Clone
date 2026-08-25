@@ -114,17 +114,18 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             truncation=True,
             return_tensors="pt",
         )
-        token_index = int(token_inputs.attention_mask[0].sum().item()) - 2
-        if token_index < 0:
-            raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
-        concept_token_indices[concept] = [token_index]
+        valid_token_count = int(token_inputs.attention_mask[0].sum().item())
+        content_indices = list(range(valid_token_count - 1))
+        if not content_indices:
+            raise RuntimeError(f"No content token found for {concept!r}.")
+        concept_token_indices[concept] = content_indices
 
     target_token_indices = {
         concept: concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: [0] if concept == "" else concept_token_indices[concept]
+        concept: [0] if concept == "" else [concept_token_indices[concept][-1]]
         for concept in anchor_concepts
     }
     for concept in target_concepts:
@@ -132,7 +133,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     for concept in anchor_concepts:
         print(f"anchor {concept}: {anchor_token_indices[concept]}")
     retain_token_indices = {
-        concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
+        concept: list(range(1, max_sequence_length)) if concept == "" else [concept_token_indices[concept][-1]]
         for concept in retain_texts
     }
 
@@ -192,8 +193,19 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                     concept_trace = layer_target_traces[concept]
                     target_inputs = concept_trace[module_name]["inputs"]
                     anchor_inputs = anchor_base_traces[anchor_concept][module_name]["inputs"]
-                    sum_target_target.append(target_inputs @ target_inputs.T)
-                    sum_target_anchor.append(anchor_inputs @ target_inputs.T)
+                    if target_inputs.shape[1] % anchor_inputs.shape[1] != 0:
+                        raise RuntimeError(
+                            f"Trace shape mismatch: target={target_inputs.shape}, "
+                            f"anchor={anchor_inputs.shape}"
+                        )
+                    target_count = target_inputs.shape[1] // anchor_inputs.shape[1]
+                    anchor_inputs = anchor_inputs.repeat_interleave(target_count, dim=1)
+                    sum_target_target.append(
+                        target_inputs @ target_inputs.T / target_inputs.shape[1]
+                    )
+                    sum_target_anchor.append(
+                        anchor_inputs @ target_inputs.T / target_inputs.shape[1]
+                    )
 
                 sum_target_target = torch.stack(sum_target_target).mean(0).to(module.weight.device, torch.float32)
                 sum_target_anchor = torch.stack(sum_target_anchor).mean(0).to(module.weight.device, torch.float32)
@@ -216,7 +228,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.1-schnell")
+    parser.add_argument("--sd_ckpt", help="base version for FLUX", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--file_name", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
@@ -228,8 +240,8 @@ if __name__ == "__main__":
     parser.add_argument("--trace_batch_size", type=int, default=4)
     parser.add_argument("--params", type=str, default="KV", choices=["Q", "K", "V", "QK", "KV", "QKV"])
     parser.add_argument("--threshold", type=float, default=1e-1)
-    parser.add_argument("--trace_num_steps", type=int, default=4)
-    parser.add_argument("--trace_guidance_scale", type=float, default=0.0)
+    parser.add_argument("--trace_num_steps", type=int, default=20)
+    parser.add_argument("--trace_guidance_scale", type=float, default=3.5)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=0.1)

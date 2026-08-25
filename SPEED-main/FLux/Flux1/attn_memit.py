@@ -139,13 +139,11 @@ def _concept_token_indices(pipeline, concepts, max_sequence_length):
             truncation=True,
             return_tensors="pt",
         )
-        token_index = int(token_inputs.attention_mask[0].sum().item()) - 2
-        if token_index < 0:
-            raise RuntimeError(
-                f"Prompt token for {concept!r} was truncated by "
-                f"max_sequence_length={max_sequence_length}."
-            )
-        token_indices[concept] = [token_index]
+        valid_token_count = int(token_inputs.attention_mask[0].sum().item())
+        content_indices = list(range(valid_token_count - 1))
+        if not content_indices:
+            raise RuntimeError(f"No content token found for {concept!r}.")
+        token_indices[concept] = content_indices
     return token_indices
 
 
@@ -181,27 +179,45 @@ def edit_model(
     device="cuda:0",
     max_sequence_length=FLUX1_MAX_SEQUENCE_LENGTH,
 ):
-    selected_suffixes = [ATTENTION_SUFFIXES[param] for param in args.params]
+    selected_params = list(dict.fromkeys(args.params))
     edit_modules = []
     for name, module in pipeline.transformer.named_modules():
         if not hasattr(module, "weight") or module.weight is None:
             continue
-        if not any(name.endswith(suffix) for suffix in selected_suffixes):
+        matched_params = [
+            param
+            for param in selected_params
+            if name.endswith(ATTENTION_SUFFIXES[param])
+        ]
+        if not matched_params:
             continue
         if re.match(r"transformer_blocks\.\d+\.", name) is None:
             continue
-        edit_modules.append((name, module))
+        edit_modules.append((name, module, matched_params[0]))
 
     if not edit_modules:
         raise RuntimeError(
             f"No Flux1 text-side attention modules selected for params={args.params}"
         )
 
-    module_names = [name for name, _module in edit_modules]
-    final_module_name = module_names[-1]
-    remaining_counts = {
-        name: len(module_names) - index
-        for index, name in enumerate(module_names)
+    module_names = [name for name, _module, _param in edit_modules]
+    modules_by_param = {param: [] for param in selected_params}
+    for module_name, module, param in edit_modules:
+        modules_by_param[param].append((module_name, module))
+    if any(not modules for modules in modules_by_param.values()):
+        missing = [param for param, modules in modules_by_param.items() if not modules]
+        raise RuntimeError(f"No selected Flux1 attention modules found for params={missing}")
+
+    final_module_by_param = {
+        param: modules[-1][0]
+        for param, modules in modules_by_param.items()
+    }
+    remaining_counts_by_param = {
+        param: {
+            name: len(modules) - index
+            for index, (name, _module) in enumerate(modules)
+        }
+        for param, modules in modules_by_param.items()
     }
 
     concepts = list(dict.fromkeys(target_concepts + anchor_concepts + retain_texts))
@@ -215,13 +231,13 @@ def edit_model(
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: [0] if concept == "" else concept_indices[concept]
+        concept: [0] if concept == "" else [concept_indices[concept][-1]]
         for concept in anchor_concepts
     }
     retain_token_indices = {
         concept: list(range(1, max_sequence_length))
         if concept == ""
-        else concept_indices[concept]
+        else [concept_indices[concept][-1]]
         for concept in retain_texts
     }
 
@@ -229,7 +245,7 @@ def edit_model(
         pipeline,
         anchor_concepts,
         anchor_token_indices,
-        [final_module_name],
+        list(final_module_by_param.values()),
         args,
         device,
         max_sequence_length,
@@ -265,7 +281,8 @@ def edit_model(
         )
 
     edit_dict = {}
-    for module_name, module in edit_modules:
+    for module_name, module, param in edit_modules:
+        final_module_name = final_module_by_param[param]
         trace_names = [module_name]
         if final_module_name != module_name:
             trace_names.append(final_module_name)
@@ -287,18 +304,28 @@ def edit_model(
             anchor_final = anchor_final_traces[anchor_concept][final_module_name][
                 "outputs"
             ].to(device=current_final.device, dtype=current_final.dtype)
+            if current_final.shape[1] % anchor_final.shape[1] != 0:
+                raise RuntimeError(
+                    f"Trace shape mismatch: target={current_final.shape}, "
+                    f"anchor={anchor_final.shape}"
+                )
+            target_count = current_final.shape[1] // anchor_final.shape[1]
+            anchor_final = anchor_final.repeat_interleave(target_count, dim=1)
             target_inputs.append(concept_trace[module_name]["inputs"])
             residuals.append(
                 args.residual_scale
                 * (anchor_final - current_final)
-                / remaining_counts[module_name]
+                / remaining_counts_by_param[param][module_name]
             )
 
         target_target = torch.stack(
-            [target @ target.T for target in target_inputs]
+            [target @ target.T / target.shape[1] for target in target_inputs]
         ).mean(0)
         residual_target = torch.stack(
-            [residual @ target.T for target, residual in zip(target_inputs, residuals)]
+            [
+                residual @ target.T / target.shape[1]
+                for target, residual in zip(target_inputs, residuals)
+            ]
         ).mean(0)
         target_device = module.weight.device
         delta = _closed_form_update(
