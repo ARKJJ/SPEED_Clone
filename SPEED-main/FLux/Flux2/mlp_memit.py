@@ -93,7 +93,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         if concept != ""
     ]
     concept_token_indices = {}
-    concept_all_token_indices = {}
     for concept in non_empty_concepts:
         text = pipeline.tokenizer.apply_chat_template(
             [{"role": "user", "content": concept}],
@@ -118,18 +117,13 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         if token_index < 0:
             raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
         concept_token_indices[concept] = [token_index]
-        concept_all_token_indices[concept] = list(range(1, full_length)) or [token_index]
 
-    use_nudity_all_tokens = target_concepts == ["nudity"]
-    nudity_token_indices = concept_all_token_indices["nudity"] if use_nudity_all_tokens else None
-    if use_nudity_all_tokens:
-        print(f"nudity all-token trace positions: {nudity_token_indices}")
     target_token_indices = {
-        concept: nudity_token_indices if use_nudity_all_tokens else concept_token_indices[concept]
+        concept: concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: nudity_token_indices if use_nudity_all_tokens else ([0] if concept == "" else concept_token_indices[concept])
+        concept: [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
     retain_token_indices = {

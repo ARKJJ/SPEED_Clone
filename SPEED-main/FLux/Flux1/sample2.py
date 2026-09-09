@@ -1,9 +1,11 @@
 import argparse
-import copy
 import os
 import random
 import re
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from pathlib import Path
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 warnings.filterwarnings("ignore")
@@ -22,7 +24,7 @@ from template import template_dict
 
 
 DATA_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-DEFAULT_MAX_SEQUENCE_LENGTH = 256
+DEFAULT_MAX_SEQUENCE_LENGTH = 512
 
 
 def seed_everything(seed, deterministic=False):
@@ -64,22 +66,26 @@ def prepare_shared_latents(pipe, seeds, args):
     return latents
 
 
-def flux_generate(pipe, prompts, seeds, args, desc=None, latents_by_seed=None):
+def flux_generate(pipe, prompts, seeds, args, desc=None, latents_by_seed=None, stream=None):
     images = []
-    for prompt, seed in zip(prompts, seeds):
-        kwargs = dict(
-            prompt=prompt,
-            num_inference_steps=args.total_timesteps,
-            guidance_scale=args.guidance_scale,
-            height=args.height,
-            width=args.width,
-            max_sequence_length=args.max_sequence_length,
-        )
-        if latents_by_seed is None:
-            kwargs["generator"] = torch.Generator(device=pipe.device).manual_seed(int(seed))
-        else:
-            kwargs["latents"] = latents_by_seed[int(seed)].clone()
-        images.append(pipe(**kwargs).images[0])
+    stream_context = torch.cuda.stream(stream) if stream is not None else nullcontext()
+    with stream_context:
+        for prompt, seed in zip(prompts, seeds):
+            kwargs = dict(
+                prompt=prompt,
+                num_inference_steps=args.total_timesteps,
+                guidance_scale=args.guidance_scale,
+                height=args.height,
+                width=args.width,
+                max_sequence_length=args.max_sequence_length,
+            )
+            if latents_by_seed is None:
+                kwargs["generator"] = torch.Generator(device=pipe.device).manual_seed(int(seed))
+            else:
+                kwargs["latents"] = latents_by_seed[int(seed)].clone()
+            images.append(pipe(**kwargs).images[0])
+    if stream is not None:
+        stream.synchronize()
     if desc is not None:
         print(f"{desc}: generated {len(images)} images")
     return images
@@ -122,14 +128,14 @@ def combine_images_horizontally(images):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_root", type=str, default="")
-    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.1-schnell")
+    parser.add_argument("--sd_ckpt", type=str, default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--model_id", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--mode", type=str, default="original", help="original, edit")
-    parser.add_argument("--guidance_scale", type=float, default=0.0)
-    parser.add_argument("--total_timesteps", type=int, default=4)
+    parser.add_argument("--guidance_scale", type=float, default=3.5)
+    parser.add_argument("--total_timesteps", type=int, default=20)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--prompts", type=str, default=None)
@@ -142,10 +148,16 @@ def main():
     parser.add_argument("--edit_ckpt", type=str, default=None)
     parser.add_argument("--data_root", type=str, default=DATA_ROOT)
     parser.add_argument("--dataset_path", type=str, default=None)
-    parser.add_argument("--i2p_path", type=str, default=None)
+    parser.add_argument("--nudity_path", type=str, default=None)
     parser.add_argument("--coco_path", type=str, default=None)
     parser.add_argument("--max_num", type=int, default=None)
     args = parser.parse_args()
+    if args.num_samples < 1:
+        parser.error("--num_samples must be at least 1")
+    if args.batch_size < 1:
+        parser.error("--batch_size must be at least 1")
+    if args.total_timesteps < 1:
+        parser.error("--total_timesteps must be at least 1")
 
     diffusers_logging.set_verbosity_error()
     diffusers_logging.enable_progress_bar()
@@ -178,61 +190,92 @@ def main():
         if not contents:
             return
 
-    pipe = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
-
-    if "edit" in mode_list:
-        pipe_edit = copy.deepcopy(pipe) if "original" in mode_list else pipe
+    paired_mode = "original" in mode_list and "edit" in mode_list
+    if paired_mode:
+        if not args.device.startswith("cuda"):
+            raise ValueError("Paired parallel generation requires a CUDA --device")
         if args.edit_ckpt is None:
             raise ValueError("--edit_ckpt is required when --mode includes edit")
+        pipe_original = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
+        pipe_edit = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
         load_edit_weights(pipe_edit, args.edit_ckpt)
-    else:
-        pipe_edit = None
+        original_stream = torch.cuda.Stream(device=args.device)
+        edit_stream = torch.cuda.Stream(device=args.device)
+    elif "original" in mode_list:
+        pipe_original = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
+    elif "edit" in mode_list:
+        if args.edit_ckpt is None:
+            raise ValueError("--edit_ckpt is required when --mode includes edit")
+        pipe_edit = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
+        load_edit_weights(pipe_edit, args.edit_ckpt)
 
-    for content in contents:
-        dataset = AdaDataset(content=content, args=args)
-        dataloader = DataLoader(dataset, batch_size=bs, drop_last=False)
-
-        for count, data in enumerate(tqdm(dataloader, desc=f"{content} batches")):
-            prompts = list(data["prompt"])
-            seeds = [int(x) for x in data["seed"]]
-            filenames = list(data["filename"])
-            save_images = {}
-            paired = "original" in mode_list and "edit" in mode_list
-            shared_latents = prepare_shared_latents(pipe, seeds, args) if paired else None
-
-            if "original" in mode_list:
-                save_images["original"] = flux_generate(
+    def generate_pass(pass_mode, pipe):
+        for content in contents:
+            dataset = AdaDataset(content=content, args=args)
+            dataloader = DataLoader(dataset, batch_size=bs, drop_last=False)
+            save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), content)
+            os.makedirs(os.path.join(save_path, pass_mode), exist_ok=True)
+            for count, data in enumerate(tqdm(dataloader, desc=f"{content} {pass_mode} batches")):
+                prompts = list(data["prompt"])
+                seeds = [int(x) for x in data["seed"]]
+                filenames = list(data["filename"])
+                images = flux_generate(
                     pipe=pipe,
                     prompts=prompts,
                     seeds=seeds,
                     args=args,
-                    desc=f"{count * len(prompts)} x prompts | original",
-                    latents_by_seed=shared_latents,
+                    desc=f"{count * len(prompts)} x prompts | {pass_mode}",
                 )
-            if "edit" in mode_list:
-                save_images["edit"] = flux_generate(
-                    pipe=pipe_edit,
-                    prompts=prompts,
-                    seeds=seeds,
-                    args=args,
-                    desc=f"{count * len(prompts)} x prompts | edit",
-                    latents_by_seed=shared_latents,
-                )
+                for image, save_filename in zip(images, filenames):
+                    image.save(os.path.join(save_path, pass_mode, save_filename))
 
+    def generate_paired():
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for content in contents:
+                dataset = AdaDataset(content=content, args=args)
+                dataloader = DataLoader(dataset, batch_size=bs, drop_last=False)
+                save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), content)
+                for pass_mode in ("original", "edit"):
+                    os.makedirs(os.path.join(save_path, pass_mode), exist_ok=True)
+                for count, data in enumerate(tqdm(dataloader, desc=f"{content} paired batches")):
+                    prompts = list(data["prompt"])
+                    seeds = [int(x) for x in data["seed"]]
+                    filenames = list(data["filename"])
+                    shared_latents = prepare_shared_latents(pipe_original, seeds, args)
+                    original_future = executor.submit(
+                        flux_generate, pipe_original, prompts, seeds, args,
+                        f"{count * len(prompts)} x prompts | original", shared_latents, original_stream,
+                    )
+                    edit_future = executor.submit(
+                        flux_generate, pipe_edit, prompts, seeds, args,
+                        f"{count * len(prompts)} x prompts | edit", shared_latents, edit_stream,
+                    )
+                    for pass_mode, images in (("original", original_future.result()), ("edit", edit_future.result())):
+                        for image, save_filename in zip(images, filenames):
+                            image.save(os.path.join(save_path, pass_mode, save_filename))
+
+    if paired_mode:
+        generate_paired()
+    elif "original" in mode_list:
+        generate_pass("original", pipe_original)
+    elif "edit" in mode_list:
+        generate_pass("edit", pipe_edit)
+
+    if "original" in mode_list and "edit" in mode_list:
+        for content in contents:
             save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), content)
-            for mode in mode_list:
-                os.makedirs(os.path.join(save_path, mode), exist_ok=True)
-            if len(mode_list) > 1:
-                os.makedirs(os.path.join(save_path, "combine"), exist_ok=True)
-
-            for idx, save_filename in enumerate(filenames):
-                images_to_combine = []
-                for mode in mode_list:
-                    save_images[mode][idx].save(os.path.join(save_path, mode, save_filename))
-                    images_to_combine.append(save_images[mode][idx])
-                if len(mode_list) > 1:
-                    img_combined = combine_images_horizontally(images_to_combine)
-                    img_combined.save(os.path.join(save_path, "combine", save_filename.replace(".png", ".jpg")))
+            original_dir = os.path.join(save_path, "original")
+            edit_dir = os.path.join(save_path, "edit")
+            combine_dir = os.path.join(save_path, "combine")
+            os.makedirs(combine_dir, exist_ok=True)
+            for save_filename in os.listdir(original_dir):
+                original_path = os.path.join(original_dir, save_filename)
+                edit_path = os.path.join(edit_dir, save_filename)
+                if not os.path.isfile(edit_path):
+                    continue
+                with Image.open(original_path) as original_image, Image.open(edit_path) as edit_image:
+                    combined = combine_images_horizontally([original_image.convert("RGB"), edit_image.convert("RGB")])
+                    combined.save(os.path.join(combine_dir, save_filename.replace(".png", ".jpg")))
 
 
 def expected_count_for_content(content, args):
@@ -247,17 +290,22 @@ class AdaDataset(Dataset):
         self.prompt_list, self.idx, self.seed, self.filename = [], [], [], []
 
         if content == "nudity":
-            data_path = args.i2p_path or os.path.join(args.data_root, "i2p_benchmark.csv")
-            data = pd.read_csv(data_path)
+            data_path = Path(args.nudity_path or os.path.join(args.data_root, "NSFW.csv"))
+            for row_index, raw_line in enumerate(data_path.read_text().splitlines()):
+                prompt = raw_line.strip().rstrip(",").strip()
+                if prompt.startswith('"') and prompt.endswith('"'):
+                    prompt = prompt[1:-1]
+                if not prompt:
+                    continue
+                self.prompt_list.append(prompt)
+                self.idx.append(row_index)
+                self.seed.append(args.seed + row_index)
+                self.filename.append(f"{row_index}_{self._safe_name(prompt, 100)}.png")
             if args.max_num is not None:
-                data = data.iloc[:args.max_num]
-            self.prompt_list = list(data["prompt"])
-            self.idx = list(range(len(self.prompt_list)))
-            self.seed = [int(x) for x in data["sd_seed"]]
-            self.filename = [
-                f"{i}_{self._safe_name(prompt, 100)}.png"
-                for i, prompt in zip(self.idx, self.prompt_list)
-            ]
+                self.prompt_list = self.prompt_list[:args.max_num]
+                self.idx = self.idx[:args.max_num]
+                self.seed = self.seed[:args.max_num]
+                self.filename = self.filename[:args.max_num]
 
         elif content == "coco":
             data_path = args.coco_path or os.path.join(args.data_root, "mscoco.csv")

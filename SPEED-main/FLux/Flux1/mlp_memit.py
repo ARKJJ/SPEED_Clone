@@ -97,6 +97,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         if concept != ""
     ]
     concept_token_indices = {}
+    concept_all_token_indices = {}
     for concept in non_empty_concepts:
         token_inputs = pipeline.tokenizer_2(
             concept,
@@ -110,8 +111,12 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         if not content_indices:
             raise RuntimeError(f"No content token found for {concept!r}.")
         concept_token_indices[concept] = content_indices
+        concept_all_token_indices[concept] = list(range(valid_token_count))
 
-    target_token_indices = {concept: concept_token_indices[concept] for concept in target_concepts}
+    target_token_indices = {
+        concept: concept_all_token_indices[concept]
+        for concept in target_concepts
+    }
     anchor_token_indices = {
         concept: [0] if concept == "" else [concept_token_indices[concept][-1]]
         for concept in anchor_concepts

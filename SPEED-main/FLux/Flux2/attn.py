@@ -131,14 +131,12 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
         concept_token_indices[concept] = [token_index]
 
-    use_nudity_all_tokens = target_concepts == ["nudity"]
-    nudity_token_indices = list(range(max_sequence_length))
     target_token_indices = {
-        concept: nudity_token_indices if use_nudity_all_tokens else concept_token_indices[concept]
+        concept: concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: nudity_token_indices if use_nudity_all_tokens else ([0] if concept == "" else concept_token_indices[concept])
+        concept: [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
     for concept in target_concepts:

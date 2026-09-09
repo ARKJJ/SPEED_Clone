@@ -11,7 +11,6 @@ from diffusers import DiffusionPipeline
 
 ATTENTION_SUFFIXES = {"Q": ".attn.add_q_proj", "K": ".attn.add_k_proj", "V": ".attn.add_v_proj"}
 
-
 def _trace_concepts(pipeline,concepts,token_indices, module_names, args, device,max_sequence_length, progress_bar=None):
     module_lookup = dict(pipeline.transformer.named_modules())
     traced_concepts = {}
@@ -105,7 +104,8 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts)
         if concept != ""
     ]
-    concept_token_indices = {}
+    concept_all_token_indices = {}
+    concept_content_indices = {}
     for concept in non_empty_concepts:
         token_inputs = pipeline.tokenizer_2(
             concept,
@@ -115,17 +115,19 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             return_tensors="pt",
         )
         valid_token_count = int(token_inputs.attention_mask[0].sum().item())
+        all_valid_indices = list(range(valid_token_count))
         content_indices = list(range(valid_token_count - 1))
         if not content_indices:
             raise RuntimeError(f"No content token found for {concept!r}.")
-        concept_token_indices[concept] = content_indices
+        concept_all_token_indices[concept] = all_valid_indices
+        concept_content_indices[concept] = content_indices
 
     target_token_indices = {
-        concept: concept_token_indices[concept]
+        concept: concept_all_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: [0] if concept == "" else [concept_token_indices[concept][-1]]
+        concept: [0] if concept == "" else [concept_content_indices[concept][-1]]
         for concept in anchor_concepts
     }
     for concept in target_concepts:
@@ -133,7 +135,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
     for concept in anchor_concepts:
         print(f"anchor {concept}: {anchor_token_indices[concept]}")
     retain_token_indices = {
-        concept: list(range(1, max_sequence_length)) if concept == "" else [concept_token_indices[concept][-1]]
+        concept: list(range(1, max_sequence_length)) if concept == "" else [concept_content_indices[concept][-1]]
         for concept in retain_texts
     }
 
@@ -193,11 +195,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                     concept_trace = layer_target_traces[concept]
                     target_inputs = concept_trace[module_name]["inputs"]
                     anchor_inputs = anchor_base_traces[anchor_concept][module_name]["inputs"]
-                    if target_inputs.shape[1] % anchor_inputs.shape[1] != 0:
-                        raise RuntimeError(
-                            f"Trace shape mismatch: target={target_inputs.shape}, "
-                            f"anchor={anchor_inputs.shape}"
-                        )
                     target_count = target_inputs.shape[1] // anchor_inputs.shape[1]
                     anchor_inputs = anchor_inputs.repeat_interleave(target_count, dim=1)
                     sum_target_target.append(

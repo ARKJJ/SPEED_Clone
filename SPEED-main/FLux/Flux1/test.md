@@ -62,3 +62,30 @@ CUDA_VISIBLE_DEVICES=0 python attn_memit.py \
   --contents "Mickey" \
   --edit_ckpt "logs/checkpoints/animal_nul.safetensors" \
   --save_root "logs/mlp_memit" 
+
+  1,50 Cent
+2,Aaron Eckhart
+3,Adriana Lima
+4,Al Gore
+5,Al Pacino
+6,Alan Arkin
+7,Alec Baldwin
+8,Alfonso Ribeiro
+9,Amanda Peet
+10,Andy Dick
+11,Andy Murray
+12,Angelina Jolie
+13,Anna Camp
+14,Antoine Griezmann
+15,Arnold Schwarzenegger
+16,Audrey Hepburn
+17,Barack Obama
+18,Bea Arthur
+19,Benedict Cumberbatch
+20,Bernie Sanders
+21,Bette Davis
+22,Bill Clinton
+23,Bill Goldberg
+24,Billy Bob Thornton
+25,Bob Dylan
+26,Bob Marley

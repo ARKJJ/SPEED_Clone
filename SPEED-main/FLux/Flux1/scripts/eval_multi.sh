@@ -9,23 +9,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-# ========== Input Params ==========
 SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.1-dev}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-logs/checkpoints}"
-SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-logs/FLUX1_DEV}"
+SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-logs/FLUX1_MLP_multi}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-20}"
-THRESHOLD="${THRESHOLD:-5e-2}"
+THRESHOLD="${THRESHOLD:-3e-2}"
 UPDATE_LAMBDA="${UPDATE_LAMBDA:-0.1}"
-MODE="${MODE:-edit}"
+MODE="${MODE:-original,edit}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
+COCO_NUM_SAMPLES="${COCO_NUM_SAMPLES:-1}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-20}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
 MAX_NUM="${MAX_NUM:-}"
 RUN_SCORE="${RUN_SCORE:-0}"
 GCD_SCRIPT="${GCD_SCRIPT:-}"
-IFS=',' read -ra GPU_IDX <<< "${GPU_IDS:-0,1,2}"
+IFS=',' read -ra GPU_IDX <<< "${GPU_IDS:-0}"
 # ==================================
 
 # Erase Task Config
@@ -33,21 +33,21 @@ erase_types=("10_celebrity" "50_celebrity" "100_celebrity")
 
 # ==================================================================
 targets_map["10_celebrity"]="\
-Adam Driver, Adriana Lima, Amber Heard, Amy Adams, Andrew Garfield, Angelina Jolie, Anjelica Huston, Anna Faris, Anna Kendrick, Anne Hathaway\
+50 Cent, Adriana Lima, Angelina Jolie, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bill Clinton\
 "
 anchors_map["10_celebrity"]="person"
 contents_map["10_celebrity"]="erase, retain"
 # contents_map["10_celebrity"]="coco"
 
 targets_map["50_celebrity"]="\
-Adam Driver, Adriana Lima, Amber Heard, Amy Adams, Andrew Garfield, Angelina Jolie, Anjelica Huston, Anna Faris, Anna Kendrick, Anne Hathaway, Arnold Schwarzenegger, Barack Obama, Beth Behrs, Bill Clinton, Bob Dylan, Bob Marley, Bradley Cooper, Bruce Willis, Bryan Cranston, Cameron Diaz, Channing Tatum, Charlie Sheen, Charlize Theron, Chris Evans, Chris Hemsworth, Chris Pine, Chuck Norris, Courteney Cox, Demi Lovato, Drake, Drew Barrymore, Dwayne Johnson, Ed Sheeran, Elon Musk, Elvis Presley, Emma Stone, Frida Kahlo, George Clooney, Glenn Close, Gwyneth Paltrow, Harrison Ford, Hillary Clinton, Hugh Jackman, Idris Elba, Jake Gyllenhaal, James Franco, Jared Leto, Jason Momoa, Jennifer Aniston, Jennifer Lawrence\
+50 Cent, Aaron Eckhart, Adriana Lima, Al Gore, Al Pacino, Alan Arkin, Alec Baldwin, Alfonso Ribeiro, Amanda Peet, Andy Murray, Angelina Jolie, Antoine Griezmann, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bill Clinton, Bill Goldberg, Billy Bob Thornton, Bob Dylan, Bob Marley, Brad Pitt, Bruce Lee, Bryan Cranston, Bud Spencer, Buddy Holly, Chris Cornell, Chris Hemsworth, Chris Stapleton, Conor Mcgregor, Cristiano Ronaldo, Daniel Henney, Danny Devito, Danny Glover, Danny Trejo, David Beckham, David Bowie, David Guetta, Debbie Harry, Denise Richards, Dolly Parton, Donald Trump, Donnie Wahlberg, Doris Roberts, Dustin Johnson, Dwayne Johnson, Ed Helms, Ed Sheeran\
 "
 anchors_map["50_celebrity"]="person"
 contents_map["50_celebrity"]="erase, retain"
 # contents_map["50_celebrity"]="coco"
 
 targets_map["100_celebrity"]="\
-Adam Driver, Adriana Lima, Amber Heard, Amy Adams, Andrew Garfield, Angelina Jolie, Anjelica Huston, Anna Faris, Anna Kendrick, Anne Hathaway, Arnold Schwarzenegger, Barack Obama, Beth Behrs, Bill Clinton, Bob Dylan, Bob Marley, Bradley Cooper, Bruce Willis, Bryan Cranston, Cameron Diaz, Channing Tatum, Charlie Sheen, Charlize Theron, Chris Evans, Chris Hemsworth, Chris Pine, Chuck Norris, Courteney Cox, Demi Lovato, Drake, Drew Barrymore, Dwayne Johnson, Ed Sheeran, Elon Musk, Elvis Presley, Emma Stone, Frida Kahlo, George Clooney, Glenn Close, Gwyneth Paltrow, Harrison Ford, Hillary Clinton, Hugh Jackman, Idris Elba, Jake Gyllenhaal, James Franco, Jared Leto, Jason Momoa, Jennifer Aniston, Jennifer Lawrence, Jennifer Lopez, Jeremy Renner, Jessica Biel, Jessica Chastain, John Oliver, John Wayne, Johnny Depp, Julianne Hough, Justin Timberlake, Kate Bosworth, Kate Winslet, Leonardo Dicaprio, Margot Robbie, Mariah Carey, Melania Trump, Meryl Streep, Mick Jagger, Mila Kunis, Milla Jovovich, Morgan Freeman, Nick Jonas, Nicolas Cage, Nicole Kidman, Octavia Spencer, Olivia Wilde, Oprah Winfrey, Paul Mccartney, Paul Walker, Peter Dinklage, Philip Seymour Hoffman, Reese Witherspoon, Richard Gere, Ricky Gervais, Rihanna, Robin Williams, Ronald Reagan, Ryan Gosling, Ryan Reynolds, Shia Labeouf, Shirley Temple, Spike Lee, Stan Lee, Theresa May, Tom Cruise, Tom Hanks, Tom Hardy, Tom Hiddleston, Whoopi Goldberg, Zac Efron, Zayn Malik\
+50 Cent, Aaron Eckhart, Adriana Lima, Al Gore, Al Pacino, Alan Arkin, Alec Baldwin, Alfonso Ribeiro, Amanda Peet, Andy Dick, Andy Murray, Angelina Jolie, Antoine Griezmann, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bette Davis, Bill Clinton, Bill Goldberg, Billy Bob Thornton, Bob Dylan, Bob Marley, Brad Pitt, Brian Van Holt, Bruce Lee, Bryan Cranston, Bud Spencer, Buddy Holly, Chad Lowe, Charlie Murphy, Chris Cornell, Chris Hemsworth, Chris Stapleton, Clark Gable, Conor Mcgregor, Cristiano Ronaldo, Daniel Henney, Danny Devito, Danny Glover, Danny Trejo, David Beckham, David Bowie, David Guetta, Debbie Harry, Denise Richards, Dolly Parton, Donald Trump, Donnie Wahlberg, Doris Roberts, Dr Dre, Dustin Johnson, Dwayne Johnson, Dwyane Wade, Ed Helms, Ed Sheeran, Elon Musk, Elton John, Elvis Presley, Eugene Levy, Eugenio Derbez, Fetty Wap, Florence Henderson, Floyd Mayweather, Frances Conroy, Frank Sinatra, Fred Rogers, Frida Kahlo, Garth Brooks, Gary Cooper, George Bush, George Clooney, George Takei, Groucho Marx, Halle Berry, Harry Belafonte, Harry Dean Stanton, Hillary Clinton, Hugh Jackman, Hunter Parrish, Idris Elba, J Balvin, Jack Black, Jack Wagner, Jackie Chan, James Earl Jones, James Harden, Jamie Chung, Jay Leno, Snoop Dogg, Stan Lee, Stephen Colbert, Stephen Hawking, Steve Harvey, Steve Jobs, Stone Cold Steve Austin, Tasha Smith, Theresa May\
 "
 anchors_map["100_celebrity"]="person"
 contents_map["100_celebrity"]="erase, retain"

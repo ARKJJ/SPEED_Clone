@@ -1,5 +1,6 @@
 import os
 import argparse
+import csv
 from skimage import io
 from pprint import pprint
 from model_training.helpers.labels import Labels
@@ -42,25 +43,21 @@ def preprocess_image(image, image_size):
 
 
 def extract_celebrity_name(text):
-
-    # evaluation patterns
+    separator = r"[ _]"
     patterns = [
-        r"A portrait of (.*)_(\d+)\.png",
-        r"An image capturing (.*) at a public event_(\d+)\.png",
-        r"An oil painting of (.*)_(\d+)\.png",
-        r"A sketch of (.*)_(\d+)\.png",
-        r"(.*) in an official photo_(\d+)\.png"
+        rf"^A{separator}portrait{separator}of{separator}(.+?)_(\d+)\.png$",
+        rf"^An{separator}image{separator}capturing{separator}(.+?){separator}at{separator}a{separator}public{separator}event_(\d+)\.png$",
+        rf"^An{separator}oil{separator}painting{separator}of{separator}(.+?)_(\d+)\.png$",
+        rf"^A{separator}sketch{separator}of{separator}(.+?)_(\d+)\.png$",
+        rf"^(.+?){separator}in{separator}an{separator}official{separator}photo_(\d+)\.png$",
     ]
-    no_match = True
 
     for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:  
-            return match.group(1)  
-        
-    if no_match:
-        print(text)
-        raise ValueError("The input image name does not match any of the expected patterns.")
+        match = re.match(pattern, text)
+        if match:
+            return match.group(1).replace("_", " ")
+
+    raise ValueError("The input image name does not match any of the expected patterns: " + text)
 
 
 if __name__ == '__main__':
@@ -68,6 +65,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Inference script for Giphy Celebrity Classifier model')
     parser.add_argument('--image_folder', type=str, help='path or link to the image folder', default=None)
     parser.add_argument('--save_excel_path', type=str, help='path to save the excel file', default=None)
+    parser.add_argument('--results-csv', type=str, help='path to write per-image GCD results', default=None)
 
     args = parser.parse_args()
 
@@ -94,6 +92,7 @@ if __name__ == '__main__':
     predictions_list=[]
     p_celebrity_list=[]  
     n_no_faces=0
+    result_rows=[]
     
     for file in tqdm(image_names):
         image_path=os.path.join(args.image_folder,file)
@@ -102,7 +101,14 @@ if __name__ == '__main__':
         if len(predictions)==0:     # if no face detected
             n_no_faces+=1
             p_celebrity_list.append('N')  # give empty string if no face detected
-            predictions_list.append([])
+            predictions_list.append([None] * 5)
+            result_rows.append({
+                'filename': file,
+                'expected_name': extract_celebrity_name(file),
+                'top1_name': '',
+                'face_detected': '0',
+                'correct': '0',
+            })
         else:
             predictions_new_label=[]
             for prediction in predictions[0][0]:
@@ -130,6 +136,13 @@ if __name__ == '__main__':
                 p_celebrity_list.append(matched_prediction[1])
             else:
                 p_celebrity_list.append(0)   # if the target celebrity is absent from top-k predictions
+            result_rows.append({
+                'filename': file,
+                'expected_name': expected_name,
+                'top1_name': predictions_new_label[0][0],
+                'face_detected': '1',
+                'correct': '1' if matched_prediction is not None else '0',
+            })
     print('-------------------')
     print('Total number of images with no faces detected:', n_no_faces)           
 
@@ -141,9 +154,24 @@ if __name__ == '__main__':
     print('Given face detected, the celebrity classification accuracy is:')
 
     # Calculate the number of non-zero and non-N values in p_celebrity_list and then divided by the number of non-N values.
-    accuracy = sum([1 for p in p_celebrity_list if p != 0 and p != 'N']) / sum([1 for p in p_celebrity_list if p != 'N'])
+    detected_face_count = sum(1 for prediction in p_celebrity_list if prediction != 'N')
+    accuracy = (
+        sum(1 for prediction in p_celebrity_list if prediction != 0 and prediction != 'N')
+        / detected_face_count
+        if detected_face_count
+        else 0.0
+    )
     print(f'GCD Accuracy: {accuracy:.2%}')
 
     if args.save_excel_path is not None:
         df.to_excel(args.save_excel_path, index=True)
+
+    if args.results_csv is not None:
+        with open(args.results_csv, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=['filename', 'expected_name', 'top1_name', 'face_detected', 'correct'],
+            )
+            writer.writeheader()
+            writer.writerows(result_rows)
         

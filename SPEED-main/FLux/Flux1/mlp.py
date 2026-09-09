@@ -10,7 +10,11 @@ from diffusers import DiffusionPipeline
 FLUX1_MLP_SUFFIX = ".ff_context.net.2"
 
 
-def _trace_concepts(pipeline, concepts, token_indices, module_names, args, device, max_sequence_length):
+def _add_matrix(total, matrix):
+    return matrix if total is None else total.add_(matrix)
+
+
+def _trace_concepts(pipeline, concepts, token_indices, module_names, args, device, max_sequence_length, on_concept_trace=None):
     module_lookup = dict(pipeline.transformer.named_modules())
     traced_concepts = {}
     trace_batch_size = max(1, int(getattr(args, "trace_batch_size", 1)))
@@ -62,13 +66,16 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
                     compact[name] = {
                         "inputs": input_steps[:, batch_index, :, :].reshape(-1, input_steps.shape[-1]).T,
                     }
-                traced_concepts[concept] = compact
+                if on_concept_trace is None:
+                    traced_concepts[concept] = compact
+                else:
+                    on_concept_trace(concept, compact)
+                    del compact
     return traced_concepts
 
 
-def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lambda, retain_inputs, retain_threshold=1e-1):
-    retain_inputs = retain_inputs.to(device=sum_target_target.device, dtype=sum_target_target.dtype)
-    covariance = retain_inputs @ retain_inputs.T / retain_inputs.shape[1]
+def _closed_form_update(sum_target_anchor, sum_target_target, weight, update_lambda, retain_second_moment, retain_count, retain_threshold=1e-1):
+    covariance = retain_second_moment.to(device=sum_target_target.device, dtype=sum_target_target.dtype) / retain_count
     U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
     null_basis = U[:, S < retain_threshold]
     if null_basis.shape[1] == 0:
@@ -102,12 +109,9 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             continue
         grouped_modules.setdefault(int(match.group(1)), []).append((module_name, module))
 
-    non_empty_concepts = [
-        concept
-        for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts)
-        if concept != ""
-    ]
+    non_empty_concepts = [concept for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts) if concept]
     concept_token_indices = {}
+    all_token_indices = {}
     for concept in non_empty_concepts:
         token_inputs = pipeline.tokenizer_2(
             concept,
@@ -121,11 +125,9 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         if not content_indices:
             raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
         concept_token_indices[concept] = content_indices
+        all_token_indices[concept] = list(range(valid_token_count))
 
-    target_token_indices = {
-        concept: concept_token_indices[concept]
-        for concept in target_concepts
-    }
+    target_token_indices = {concept: all_token_indices[concept] for concept in target_concepts}
     anchor_token_indices = {
         concept: [0] if concept == "" else [concept_token_indices[concept][-1]]
         for concept in anchor_concepts
@@ -145,60 +147,86 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         max_sequence_length,
     )
 
-    retain_inputs_by_module = {module_name: [] for module_name in module_names}
+    retain_second_moment_by_module = {module_name: None for module_name in module_names}
+    retain_count_by_module = {module_name: 0 for module_name in module_names}
+
+    def accumulate_retain_trace(_concept, concept_trace):
+        for module_name in module_names:
+            retain_inputs = concept_trace[module_name]["inputs"]
+            retain_second_moment_by_module[module_name] = _add_matrix(
+                retain_second_moment_by_module[module_name], retain_inputs @ retain_inputs.T
+            )
+            retain_count_by_module[module_name] += retain_inputs.shape[1]
+
     for j in range(0, len(retain_texts), args.chunk_size):
         retain_chunk = retain_texts[j:j + args.chunk_size]
-        retain_traces = _trace_concepts(pipeline, retain_chunk, retain_token_indices, module_names, args, device, max_sequence_length)
-        for module_name in module_names:
-            retain_inputs = [
-                retain_traces[concept][module_name]["inputs"]
-                for concept in retain_chunk
-                if concept in retain_traces and module_name in retain_traces[concept]
-            ]
-            if retain_inputs:
-                retain_inputs_by_module[module_name].append(torch.cat(retain_inputs, dim=1))
-        del retain_traces
+        _trace_concepts(
+            pipeline,
+            retain_chunk,
+            retain_token_indices,
+            module_names,
+            args,
+            device,
+            max_sequence_length,
+            on_concept_trace=accumulate_retain_trace,
+        )
     for module_name in module_names:
-        if not retain_inputs_by_module[module_name]:
+        if retain_second_moment_by_module[module_name] is None:
             raise RuntimeError(f"No retain trace for {module_name}")
-        retain_inputs_by_module[module_name] = torch.cat(retain_inputs_by_module[module_name], dim=1)
 
     edit_dict = {}
     for _layer_index, layer_modules in sorted(grouped_modules.items()):
         layer_module_names = [module_name for module_name, _module in layer_modules]
-        layer_target_traces = _trace_concepts(pipeline, target_concepts, target_token_indices, layer_module_names, args, device, max_sequence_length)
-        for module_name, module in layer_modules:
-            target_inputs, anchor_inputs = [], []
-            for concept, anchor_concept in zip(target_concepts, anchor_concepts):
-                concept_trace = layer_target_traces[concept]
-                target_inputs.append(concept_trace[module_name]["inputs"])
-                anchor_inputs.append(anchor_base_traces[anchor_concept][module_name]["inputs"])
+        target_to_anchor = dict(zip(target_concepts, anchor_concepts))
+        target_second_moment_by_module = {module_name: None for module_name in layer_module_names}
+        target_cross_moment_by_module = {module_name: None for module_name in layer_module_names}
+        target_matrix_count_by_module = {module_name: 0 for module_name in layer_module_names}
 
-            target_terms = []
-            cross_terms = []
-            for target, anchor in zip(target_inputs, anchor_inputs):
-                if target.shape[1] % anchor.shape[1] != 0:
+        def accumulate_target_trace(concept, concept_trace):
+            anchor_concept = target_to_anchor[concept]
+            for module_name in layer_module_names:
+                target_inputs = concept_trace[module_name]["inputs"]
+                anchor_inputs = anchor_base_traces[anchor_concept][module_name]["inputs"]
+                if target_inputs.shape[1] % anchor_inputs.shape[1] != 0:
                     raise RuntimeError(
-                        f"Trace shape mismatch: target={target.shape}, anchor={anchor.shape}"
+                        f"Trace shape mismatch: target={target_inputs.shape}, anchor={anchor_inputs.shape}"
                     )
-                target_count = target.shape[1] // anchor.shape[1]
-                anchor = anchor.repeat_interleave(target_count, dim=1)
-                target_terms.append(target @ target.T / target.shape[1])
-                cross_terms.append(anchor @ target.T / target.shape[1])
+                target_count = target_inputs.shape[1] // anchor_inputs.shape[1]
+                anchor_inputs = anchor_inputs.repeat_interleave(target_count, dim=1)
+                target_second_moment_by_module[module_name] = _add_matrix(
+                    target_second_moment_by_module[module_name], target_inputs @ target_inputs.T
+                )
+                target_cross_moment_by_module[module_name] = _add_matrix(
+                    target_cross_moment_by_module[module_name], anchor_inputs @ target_inputs.T
+                )
+                target_matrix_count_by_module[module_name] += 1
 
-            sum_target_target = torch.stack(target_terms).mean(0)
-            sum_target_anchor = torch.stack(cross_terms).mean(0)
+        _trace_concepts(
+            pipeline,
+            target_concepts,
+            target_token_indices,
+            layer_module_names,
+            args,
+            device,
+            max_sequence_length,
+            on_concept_trace=accumulate_target_trace,
+        )
+        for module_name, module in layer_modules:
+            if target_second_moment_by_module[module_name] is None:
+                raise RuntimeError(f"No target trace for {module_name}")
+            matrix_count = target_matrix_count_by_module[module_name]
+            sum_target_target = target_second_moment_by_module[module_name] / matrix_count
+            sum_target_anchor = target_cross_moment_by_module[module_name] / matrix_count
             sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
             sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
-            retain_inputs = retain_inputs_by_module[module_name]
-
             weight_before = module.weight.float()
             delta = _closed_form_update(
                 sum_target_anchor,
                 sum_target_target,
                 weight_before,
                 args.update_lambda,
-                retain_inputs.to(module.weight.device, torch.float32),
+                retain_second_moment_by_module[module_name],
+                retain_count_by_module[module_name],
                 args.threshold,
             )
             module.weight = torch.nn.Parameter(weight_before.add(delta).to(module.weight.dtype))

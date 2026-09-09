@@ -110,6 +110,7 @@ def _closed_form_update(
     )
     if retain_inputs is None:
         projector = eye
+        projector_rank = projector.shape[0]
     else:
         retain_inputs = retain_inputs.to(
             device=target_target.device,
@@ -119,16 +120,19 @@ def _closed_form_update(
         U, S, _ = torch.linalg.svd(covariance, full_matrices=False)
         null_basis = U[:, S < retain_threshold]
         projector = eye if null_basis.shape[1] == 0 else null_basis @ null_basis.T
+        projector_rank = projector.shape[0] if null_basis.shape[1] == 0 else null_basis.shape[1]
 
     system = target_target @ projector + update_lambda * eye
-    return torch.linalg.solve(
+    delta = torch.linalg.solve(
         system.T,
         (residual_target @ projector).T,
     ).T
+    return delta, projector, projector_rank
 
 
 def _concept_token_indices(pipeline, concepts, max_sequence_length):
     token_indices = {}
+    all_token_indices = {}
     for concept in dict.fromkeys(concepts):
         if concept == "":
             continue
@@ -144,7 +148,8 @@ def _concept_token_indices(pipeline, concepts, max_sequence_length):
         if not content_indices:
             raise RuntimeError(f"No content token found for {concept!r}.")
         token_indices[concept] = content_indices
-    return token_indices
+        all_token_indices[concept] = list(range(valid_token_count))
+    return token_indices, all_token_indices
 
 
 def _load_retain_texts(args, target_concepts):
@@ -201,9 +206,20 @@ def edit_model(
         )
 
     module_names = [name for name, _module, _param in edit_modules]
+    module_by_name = {
+        module_name: module
+        for module_name, module, _param in edit_modules
+    }
     modules_by_param = {param: [] for param in selected_params}
+    modules_by_layer = {}
     for module_name, module, param in edit_modules:
         modules_by_param[param].append((module_name, module))
+        layer_index = int(
+            re.match(r"transformer_blocks\.(\d+)\.", module_name).group(1)
+        )
+        modules_by_layer.setdefault(layer_index, []).append(
+            (module_name, module, param)
+        )
     if any(not modules for modules in modules_by_param.values()):
         missing = [param for param, modules in modules_by_param.items() if not modules]
         raise RuntimeError(f"No selected Flux1 attention modules found for params={missing}")
@@ -221,13 +237,13 @@ def edit_model(
     }
 
     concepts = list(dict.fromkeys(target_concepts + anchor_concepts + retain_texts))
-    concept_indices = _concept_token_indices(
+    concept_indices, concept_all_token_indices = _concept_token_indices(
         pipeline,
         concepts,
         max_sequence_length,
     )
     target_token_indices = {
-        concept: concept_indices[concept]
+        concept: concept_all_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
@@ -281,11 +297,17 @@ def edit_model(
         )
 
     edit_dict = {}
-    for module_name, module, param in edit_modules:
-        final_module_name = final_module_by_param[param]
-        trace_names = [module_name]
-        if final_module_name != module_name:
-            trace_names.append(final_module_name)
+    for layer_index in sorted(modules_by_layer):
+        layer_modules = modules_by_layer[layer_index]
+        trace_names = list(
+            dict.fromkeys(
+                [module_name for module_name, _module, _param in layer_modules]
+                + [
+                    final_module_by_param[param]
+                    for _module_name, _module, param in layer_modules
+                ]
+            )
+        )
         target_traces = _trace_concepts(
             pipeline,
             target_concepts,
@@ -296,49 +318,67 @@ def edit_model(
             max_sequence_length,
         )
 
-        target_inputs = []
-        residuals = []
-        for concept, anchor_concept in zip(target_concepts, anchor_concepts):
-            concept_trace = target_traces[concept]
-            current_final = concept_trace[final_module_name]["outputs"]
-            anchor_final = anchor_final_traces[anchor_concept][final_module_name][
-                "outputs"
-            ].to(device=current_final.device, dtype=current_final.dtype)
-            if current_final.shape[1] % anchor_final.shape[1] != 0:
-                raise RuntimeError(
-                    f"Trace shape mismatch: target={current_final.shape}, "
-                    f"anchor={anchor_final.shape}"
+        layer_deltas = {}
+        for module_name, module, param in layer_modules:
+            final_module_name = final_module_by_param[param]
+            target_inputs = []
+            residuals = []
+            for concept, anchor_concept in zip(target_concepts, anchor_concepts):
+                concept_trace = target_traces[concept]
+                current_final = concept_trace[final_module_name]["outputs"]
+                anchor_final = anchor_final_traces[anchor_concept][final_module_name][
+                    "outputs"
+                ].to(device=current_final.device, dtype=current_final.dtype)
+                if current_final.shape[1] % anchor_final.shape[1] != 0:
+                    raise RuntimeError(
+                        f"Trace shape mismatch: target={current_final.shape}, "
+                        f"anchor={anchor_final.shape}"
+                    )
+                target_count = current_final.shape[1] // anchor_final.shape[1]
+                anchor_final = anchor_final.repeat_interleave(target_count, dim=1)
+                target_inputs.append(concept_trace[module_name]["inputs"])
+                residuals.append(
+                    args.residual_scale
+                    * (anchor_final - current_final)
+                    / remaining_counts_by_param[param][module_name]
                 )
-            target_count = current_final.shape[1] // anchor_final.shape[1]
-            anchor_final = anchor_final.repeat_interleave(target_count, dim=1)
-            target_inputs.append(concept_trace[module_name]["inputs"])
-            residuals.append(
-                args.residual_scale
-                * (anchor_final - current_final)
-                / remaining_counts_by_param[param][module_name]
-            )
 
-        target_target = torch.stack(
-            [target @ target.T / target.shape[1] for target in target_inputs]
-        ).mean(0)
-        residual_target = torch.stack(
-            [
-                residual @ target.T / target.shape[1]
-                for target, residual in zip(target_inputs, residuals)
-            ]
-        ).mean(0)
-        target_device = module.weight.device
-        delta = _closed_form_update(
-            residual_target.to(target_device, torch.float32),
-            target_target.to(target_device, torch.float32),
-            args.update_lambda,
-            retain_inputs_by_module[module_name].to(target_device, torch.float32),
-            args.threshold,
-        )
-        module.weight = torch.nn.Parameter(
-            module.weight.float().add(delta).to(module.weight.dtype)
-        )
-        edit_dict[module_name + ".weight"] = module.weight.detach().clone()
+            target_inputs = torch.cat(target_inputs, dim=1)
+            residuals = torch.cat(residuals, dim=1)
+            target_target = target_inputs @ target_inputs.T
+            residual_target = residuals @ target_inputs.T
+            effective_update_lambda = args.update_lambda * target_inputs.shape[1]
+            target_device = module.weight.device
+            weight_before = module.weight.detach().float()
+            delta, projector, projector_rank = _closed_form_update(
+                residual_target.to(target_device, torch.float32),
+                target_target.to(target_device, torch.float32),
+                effective_update_lambda,
+                retain_inputs_by_module[module_name].to(target_device, torch.float32),
+                args.threshold,
+            )
+            projected_inputs = projector @ target_inputs.to(target_device, torch.float32)
+            residual_target_values = residuals.to(target_device, torch.float32)
+            projected_fit = torch.linalg.vector_norm(
+                delta @ projected_inputs - residual_target_values
+            ) / torch.linalg.vector_norm(residual_target_values).clamp_min(1e-12)
+            relative_update = torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(
+                weight_before.to(target_device, torch.float32)
+            ).clamp_min(1e-12)
+            print(
+                f"[{param}] {module_name}: rel_update={relative_update.item():.3e}, "
+                f"projected_fit={projected_fit.item():.3e}, "
+                f"retain_projector_rank={projector_rank}, "
+                f"effective_lambda={effective_update_lambda:.3e}"
+            )
+            layer_deltas[module_name] = delta.detach().clone()
+
+        for module_name, delta in layer_deltas.items():
+            module = module_by_name[module_name]
+            module.weight = torch.nn.Parameter(
+                module.weight.float().add(delta).to(module.weight.dtype)
+            )
+            edit_dict[module_name + ".weight"] = module.weight.detach().clone()
 
     return edit_dict
 
@@ -373,12 +413,12 @@ if __name__ == "__main__":
         choices=["Q", "K", "V", "QK", "KV", "QKV"],
     )
     parser.add_argument("--threshold", type=float, default=1e-1)
-    parser.add_argument("--trace_num_steps", type=int, default=4)
-    parser.add_argument("--trace_guidance_scale", type=float, default=0.0)
+    parser.add_argument("--trace_num_steps", type=int, default=20)
+    parser.add_argument("--trace_guidance_scale", type=float, default=3.5)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=0.1)
-    parser.add_argument("--residual_scale", type=float, default=1.0)
+    parser.add_argument("--residual_scale", type=float, default=6)
     parser.add_argument(
         "--max_sequence_length",
         type=int,

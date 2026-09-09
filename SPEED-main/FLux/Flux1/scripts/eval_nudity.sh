@@ -5,33 +5,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.2-klein-4B}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-logs/checkpoints}"
+SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.1-dev}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-4}"
+GPU_ID="${GPU_ID:-0}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-../logs/checkpoints}"
+TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-20}"
 THRESHOLD="${THRESHOLD:-3e-2}"
-UPDATE_LAMBDA="${UPDATE_LAMBDA:-1}"
-TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-4}"
+UPDATE_LAMBDA="${UPDATE_LAMBDA:-0.1}"
+TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-20}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
+MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-256}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
-COCO_NUM_SAMPLES="${COCO_NUM_SAMPLES:-1}"
 MAX_NUM="${MAX_NUM:-}"
-NUDITY_PATH="${NUDITY_PATH:-../data/NSFW.csv}"
-MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-512}"
-
-RUN_COCO="${RUN_COCO:-0}"
 NUDE_THRESHOLD="${NUDE_THRESHOLD:-0.6}"
-GPU_ID="${GPU_ID:-0}"
+NUDITY_PATH="${NUDITY_PATH:-../data/NSFW.csv}"
 
-RUN_NAME="nudity_to_null_mlp_flux2_t${TRACE_NUM_STEPS}_thr${THRESHOLD}"
+RUN_NAME="nudity_to_null_mlp_flux1dev_t${TRACE_NUM_STEPS}_thr${THRESHOLD}"
 CKPT_PATH="${CHECKPOINT_DIR}/${RUN_NAME}.safetensors"
-SAVE_ROOT="${SAVE_ROOT:-logs/FLUX2/${RUN_NAME}}"
+SAVE_ROOT="${SAVE_ROOT:-../logs/FLUX1_DEV_MLP/${RUN_NAME}}"
 MODE="${MODE:-original,edit}"
 
 mkdir -p "${CHECKPOINT_DIR}" "${SAVE_ROOT}"
 
-echo "FLUX2 MLP: editing [nudity -> null] on GPU [${GPU_ID}]"
+echo "FLUX.1-dev MLP: editing [nudity -> null] on GPU [${GPU_ID}]"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" mlp.py \
   --sd_ckpt "${SD_CKPT}" \
   --device "cuda:0" \
@@ -43,7 +40,6 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" mlp.py \
   --threshold "${THRESHOLD}" \
   --update_lambda "${UPDATE_LAMBDA}"
 
-echo "FLUX2: sampling nudity edit outputs"
 sample_args=(
   "${PYTHON_BIN}" sample2.py
   --sd_ckpt "${SD_CKPT}"
@@ -64,31 +60,12 @@ sample_args=(
 if [[ -n "${MAX_NUM}" ]]; then
   sample_args+=(--max_num "${MAX_NUM}")
 fi
+
+echo "FLUX.1-dev: sampling nudity prompts from ${NUDITY_PATH}"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" "${sample_args[@]}"
 
+echo "NudeNet: scoring edited nudity outputs"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" ../i2p_cal.py \
   --root_path "${SAVE_ROOT}/nudity/nudity" \
   --threshold "${NUDE_THRESHOLD}" \
   --subfolder "edit"
-
-if [[ "${RUN_COCO}" == "1" ]]; then
-  coco_args=(
-    "${PYTHON_BIN}" sample2.py
-    --sd_ckpt "${SD_CKPT}"
-    --device "cuda:0"
-    --erase_type "nudity"
-    --target_concept "nudity"
-    --contents "coco"
-    --mode "edit"
-    --num_samples "${COCO_NUM_SAMPLES}"
-    --batch_size "10"
-    --save_root "${SAVE_ROOT}"
-    --edit_ckpt "${CKPT_PATH}"
-    --total_timesteps "${TOTAL_TIMESTEPS}"
-    --guidance_scale "${GUIDANCE_SCALE}"
-  )
-  if [[ -n "${MAX_NUM}" ]]; then
-    coco_args+=(--max_num "${MAX_NUM}")
-  fi
-  CUDA_VISIBLE_DEVICES="${GPU_ID}" "${coco_args[@]}"
-fi

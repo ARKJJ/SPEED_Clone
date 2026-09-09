@@ -1,4 +1,5 @@
 import os, re, copy, argparse, random, warnings
+from pathlib import Path
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 warnings.filterwarnings("ignore")
 
@@ -9,7 +10,7 @@ from tqdm import tqdm
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from diffusers import DiffusionPipeline
+from diffusers import Flux2KleinPipeline
 from diffusers.utils import logging as diffusers_logging
 from safetensors.torch import load_file
 
@@ -30,7 +31,7 @@ def seed_everything(seed, deterministic=False):
 
 
 def load_flux_pipeline(model_id, device, torch_dtype):
-    pipe = DiffusionPipeline.from_pretrained(model_id, safety_checker=None, torch_dtype=torch_dtype).to(device)
+    pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch_dtype).to(device)
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
     try:
@@ -93,6 +94,7 @@ def main():
     parser.add_argument("--data_root", type=str, default=DATA_ROOT)
     parser.add_argument("--dataset_path", type=str, default=None)
     parser.add_argument("--i2p_path", type=str, default=None)
+    parser.add_argument("--nudity_path", type=str, default=None)
     parser.add_argument("--coco_path", type=str, default=None)
     parser.add_argument("--max_num", type=int, default=None)
     args = parser.parse_args()
@@ -214,17 +216,22 @@ class AdaDataset(Dataset):
         self.prompt_list, self.idx, self.seed, self.filename = [], [], [], []
 
         if content == "nudity":
-            data_path = args.i2p_path or os.path.join(args.data_root, "i2p_benchmark.csv")
-            data = pd.read_csv(data_path)
+            data_path = Path(args.nudity_path or os.path.join(args.data_root, "NSFW.csv"))
+            for row_index, raw_line in enumerate(data_path.read_text().splitlines()):
+                prompt = raw_line.strip().rstrip(",").strip()
+                if prompt.startswith('"') and prompt.endswith('"'):
+                    prompt = prompt[1:-1]
+                if not prompt:
+                    continue
+                self.prompt_list.append(prompt)
+                self.idx.append(row_index)
+                self.seed.append(args.seed + row_index)
+                self.filename.append(f"{row_index}_{self._safe_name(prompt, 100)}.png")
             if args.max_num is not None:
-                data = data.iloc[:args.max_num]
-            self.prompt_list = list(data["prompt"])
-            self.idx = list(range(len(self.prompt_list)))
-            self.seed = [int(x) for x in data["sd_seed"]]
-            self.filename = [
-                f"{i}_{self._safe_name(prompt, 100)}.png"
-                for i, prompt in zip(self.idx, self.prompt_list)
-            ]
+                self.prompt_list = self.prompt_list[:args.max_num]
+                self.idx = self.idx[:args.max_num]
+                self.seed = self.seed[:args.max_num]
+                self.filename = self.filename[:args.max_num]
 
         elif content == "coco":
             data_path = args.coco_path or os.path.join(args.data_root, "mscoco.csv")
