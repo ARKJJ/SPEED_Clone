@@ -5,7 +5,6 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-from PIL import Image
 from tqdm import tqdm
 
 import torch
@@ -49,7 +48,6 @@ def flux_generate(pipe, prompts, seeds, args, desc=None):
             prompt=prompt,
             generator=generator,
             num_inference_steps=args.total_timesteps,
-            guidance_scale=args.guidance_scale,
             height=args.height,
             width=args.width,
             max_sequence_length=args.max_sequence_length,
@@ -61,7 +59,7 @@ def flux_generate(pipe, prompts, seeds, args, desc=None):
 
 
 def expected_count_for_content(content, args):
-    if content in ["nudity", "coco", "erase", "retain"]:
+    if content in ["nudity", "i2p", "coco", "erase", "retain"]:
         return len(AdaDataset(content=content, args=args))
     return len(template_dict[args.erase_type]) * args.num_samples
 
@@ -78,7 +76,6 @@ def main():
     parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     # Sampling Config
     parser.add_argument("--mode", type=str, default="original", help="original, edit")
-    parser.add_argument("--guidance_scale", type=float, default=3.5)
     parser.add_argument("--total_timesteps", type=int, default=20)
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=10)
@@ -114,21 +111,31 @@ def main():
 
     model_id = args.model_id or args.sd_ckpt
     contents = [x.strip() for x in args.contents.split(",") if x.strip()]
-    if "edit" in mode_list:
-        sampled_contents = []
-        for content in contents:
-            check_path = os.path.join(
-                args.save_root,
-                args.target_concept.replace(", ", "_"),
-                content,
-                "edit",
-            )
+    sampled_contents = []
+    for content in contents:
+        expected_count = expected_count_for_content(content, args)
+        content_root = os.path.join(
+            args.save_root,
+            args.target_concept.replace(", ", "_"),
+            content,
+        )
+        requested_modes = [mode for mode in mode_list if mode in {"original", "edit"}]
+        if not requested_modes:
+            raise ValueError("--mode must contain 'original', 'edit', or both")
+        complete = True
+        for mode in requested_modes:
+            check_path = os.path.join(content_root, mode)
             os.makedirs(check_path, exist_ok=True)
-            if len(os.listdir(check_path)) != expected_count_for_content(content, args):
-                sampled_contents.append(content)
-        contents = sampled_contents
-        if not contents:
-            return
+            image_count = sum(
+                name.lower().endswith((".png", ".jpg", ".jpeg"))
+                for name in os.listdir(check_path)
+            )
+            complete = complete and image_count == expected_count
+        if not complete:
+            sampled_contents.append(content)
+    contents = sampled_contents
+    if not contents:
+        return
 
     pipe = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
 
@@ -160,13 +167,6 @@ def main():
         )
     else:
         pipe_edit = None
-    def combine_images_horizontally(images):
-        widths, heights = zip(*(img.size for img in images))
-        new_img = Image.new("RGB", (sum(widths), max(heights)))
-        for i, img in enumerate(images):
-            new_img.paste(img, (sum(widths[:i]), 0))
-        return new_img
-
     for content in contents:
         dataset = AdaDataset(content=content, args=args)
         dataloader = DataLoader(dataset, batch_size=bs, drop_last=False)
@@ -197,17 +197,10 @@ def main():
             save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), content)
             for mode in mode_list:
                 os.makedirs(os.path.join(save_path, mode), exist_ok=True)
-            if len(mode_list) > 1:
-                os.makedirs(os.path.join(save_path, "combine"), exist_ok=True)
 
             for idx, save_filename in enumerate(filenames):
-                images_to_combine = []
                 for mode in mode_list:
                     save_images[mode][idx].save(os.path.join(save_path, mode, save_filename))
-                    images_to_combine.append(save_images[mode][idx])
-                if len(mode_list) > 1:
-                    img_combined = combine_images_horizontally(images_to_combine)
-                    img_combined.save(os.path.join(save_path, "combine", save_filename.replace(".png", ".jpg")))
 
 
 class AdaDataset(Dataset):
@@ -232,6 +225,18 @@ class AdaDataset(Dataset):
                 self.idx = self.idx[:args.max_num]
                 self.seed = self.seed[:args.max_num]
                 self.filename = self.filename[:args.max_num]
+
+        elif content == "i2p":
+            data_path = Path(args.i2p_path or os.path.join(args.data_root, "i2p_benchmark.csv"))
+            data = pd.read_csv(data_path)
+            data = data.iloc[:4703 if args.max_num is None else args.max_num]
+            self.prompt_list = list(data["prompt"])
+            self.idx = list(range(len(self.prompt_list)))
+            self.seed = [int(x) for x in data["sd_seed"]]
+            self.filename = [
+                f"{idx}_{self._safe_name(prompt, 100)}.png"
+                for idx, prompt in enumerate(self.prompt_list)
+            ]
 
         elif content == "coco":
             data_path = args.coco_path or os.path.join(args.data_root, "mscoco.csv")

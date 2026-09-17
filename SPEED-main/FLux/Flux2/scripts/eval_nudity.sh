@@ -12,7 +12,6 @@ TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-4}"
 THRESHOLD="${THRESHOLD:-3e-2}"
 UPDATE_LAMBDA="${UPDATE_LAMBDA:-1}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-4}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 COCO_NUM_SAMPLES="${COCO_NUM_SAMPLES:-1}"
@@ -58,7 +57,6 @@ sample_args=(
   --edit_ckpt "${CKPT_PATH}"
   --nudity_path "${NUDITY_PATH}"
   --total_timesteps "${TOTAL_TIMESTEPS}"
-  --guidance_scale "${GUIDANCE_SCALE}"
   --max_sequence_length "${MAX_SEQUENCE_LENGTH}"
 )
 if [[ -n "${MAX_NUM}" ]]; then
@@ -85,7 +83,6 @@ if [[ "${RUN_COCO}" == "1" ]]; then
     --save_root "${SAVE_ROOT}"
     --edit_ckpt "${CKPT_PATH}"
     --total_timesteps "${TOTAL_TIMESTEPS}"
-    --guidance_scale "${GUIDANCE_SCALE}"
   )
   if [[ -n "${MAX_NUM}" ]]; then
     coco_args+=(--max_num "${MAX_NUM}")

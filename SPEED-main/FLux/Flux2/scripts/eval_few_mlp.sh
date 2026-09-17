@@ -6,30 +6,29 @@ declare -A anchors_map
 declare -A contents_map
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.1-dev}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-FLux/logs/checkpoints}"
-SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-FLux/logs/FLUX1_DEV_MLP}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-logs/checkpoints}"
+SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-logs/all_token/FLUX1_DEV_MLP}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-4}"
-THRESHOLD="${THRESHOLD:-3e-2}"
+TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-10}"
+THRESHOLD="${THRESHOLD:-1e-4}"
 UPDATE_LAMBDA="${UPDATE_LAMBDA:-1}"
 MODE="${MODE:-original,edit}"
-NUM_SAMPLES="${NUM_SAMPLES:-20}"
-BATCH_SIZE="${BATCH_SIZE:-20}"
+NUM_SAMPLES="${NUM_SAMPLES:-2}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 COCO_NUM_SAMPLES="${COCO_NUM_SAMPLES:-1}"
-TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-4}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
+TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-10}"
 MAX_NUM="${MAX_NUM:-}"
 RUN_SCORE="${RUN_SCORE:-1}"
 SCORE_ONLY="${SCORE_ONLY:-0}"
-IFS=',' read -ra GPU_IDX <<< "${GPU_IDS:-0,1}"
+IFS=',' read -ra GPU_IDX <<< "${GPU_IDS:-0}"
 
-erase_types=("style")
+erase_types=("instance")
 targets_map["instance"]="Snoopy;Snoopy, Mickey;Snoopy, Mickey, Spongebob"
-anchors_map["instance"]="animal;animal;animal"
+anchors_map["instance"]=" ; ; "
 contents_map["instance"]="Snoopy, Mickey, Spongebob, Pikachu, Hello Kitty"
 targets_map["style"]="Van Gogh;Picasso;Caravaggio"
 anchors_map["style"]="painting;painting;painting"
@@ -83,12 +82,12 @@ run_task() {
   fi
 
   echo "FLUX MLP: editing [${erase_type}] [${limited_target} -> ${anchor}] on GPU [${gpu_id}] with [all MLP layers, trace_steps=${TRACE_NUM_STEPS}]"
-  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/CE_Flux_mlp.py \
+  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" mlp.py \
     --sd_ckpt "${SD_CKPT}" \
     --device "cuda:0" \
     --target_concepts "${target}" \
     --anchor_concepts "${anchor}" \
-    --retain_path "FLux/data/${erase_type}.csv" \
+    --retain_path "../data/${erase_type}.csv" \
     --heads "concept" \
     --save_path "${CHECKPOINT_DIR}" \
     --file_name "${run_name}" \
@@ -105,7 +104,7 @@ run_task() {
 
     if [[ "${content}" == "coco" ]]; then
       local sample2_args=(
-        "${PYTHON_BIN}" FLux/sample2.py
+        "${PYTHON_BIN}" sample2.py
         --sd_ckpt "${SD_CKPT}"
         --device "cuda:0"
         --erase_type "${erase_type}"
@@ -117,14 +116,13 @@ run_task() {
         --save_root "${target_root}"
         --edit_ckpt "${ckpt_path}"
         --total_timesteps "${TOTAL_TIMESTEPS}"
-        --guidance_scale "${GUIDANCE_SCALE}"
       )
       if [[ -n "${MAX_NUM}" ]]; then
         sample2_args+=(--max_num "${MAX_NUM}")
       fi
       CUDA_VISIBLE_DEVICES="${gpu_id}" "${sample2_args[@]}"
     else
-      CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/sample.py \
+      CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" sample.py \
         --sd_ckpt "${SD_CKPT}" \
         --device "cuda:0" \
         --erase_type "${erase_type}" \
@@ -135,8 +133,7 @@ run_task() {
         --batch_size "${BATCH_SIZE}" \
         --save_root "${target_root}" \
         --edit_ckpt "${ckpt_path}" \
-        --total_timesteps "${TOTAL_TIMESTEPS}" \
-        --guidance_scale "${GUIDANCE_SCALE}"
+        --total_timesteps "${TOTAL_TIMESTEPS}"
     fi
   done
 
@@ -153,11 +150,11 @@ score_target() {
     return
   fi
 
-  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" FLux/score_cal.py \
+  CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" ../score_cal.py \
     --contents "${contents}" \
     --root_path "${target_path}" \
     --sub_root "edit" \
-    --pretrained_path "FLux/data/pretrain/${erase_type}"
+    --pretrained_path "../data/pretrain/${erase_type}"
 }
 
 NUM_GPUS=${#GPU_IDX[@]}

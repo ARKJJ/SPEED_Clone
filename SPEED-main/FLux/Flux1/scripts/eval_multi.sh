@@ -11,16 +11,16 @@ cd "${PROJECT_ROOT}"
 
 SD_CKPT="${SD_CKPT:-black-forest-labs/FLUX.1-dev}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-logs/checkpoints}"
-SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-logs/FLUX1_MLP_multi}"
+SAVE_ROOT_BASE="${SAVE_ROOT_BASE:-logs/multi_alltoken/FLUX1_MLP_multi}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-20}"
-THRESHOLD="${THRESHOLD:-3e-2}"
-UPDATE_LAMBDA="${UPDATE_LAMBDA:-0.1}"
+TRACE_NUM_STEPS="${TRACE_NUM_STEPS:-10}"
+THRESHOLD="${THRESHOLD:-1e-8}"
+UPDATE_LAMBDA="${UPDATE_LAMBDA:-1}"
 MODE="${MODE:-original,edit}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
 COCO_NUM_SAMPLES="${COCO_NUM_SAMPLES:-1}"
-TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-20}"
+TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-10}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
 MAX_NUM="${MAX_NUM:-}"
 RUN_SCORE="${RUN_SCORE:-0}"
@@ -33,21 +33,21 @@ erase_types=("10_celebrity" "50_celebrity" "100_celebrity")
 
 # ==================================================================
 targets_map["10_celebrity"]="\
-50 Cent, Adriana Lima, Angelina Jolie, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bill Clinton\
+50 Cent, Adriana Lima, Al Pacino, Alfonso Ribeiro, Andy Murray, Angelina Jolie, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur\
 "
 anchors_map["10_celebrity"]="person"
 contents_map["10_celebrity"]="erase, retain"
 # contents_map["10_celebrity"]="coco"
 
 targets_map["50_celebrity"]="\
-50 Cent, Aaron Eckhart, Adriana Lima, Al Gore, Al Pacino, Alan Arkin, Alec Baldwin, Alfonso Ribeiro, Amanda Peet, Andy Murray, Angelina Jolie, Antoine Griezmann, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bill Clinton, Bill Goldberg, Billy Bob Thornton, Bob Dylan, Bob Marley, Brad Pitt, Bruce Lee, Bryan Cranston, Bud Spencer, Buddy Holly, Chris Cornell, Chris Hemsworth, Chris Stapleton, Conor Mcgregor, Cristiano Ronaldo, Daniel Henney, Danny Devito, Danny Glover, Danny Trejo, David Beckham, David Bowie, David Guetta, Debbie Harry, Denise Richards, Dolly Parton, Donald Trump, Donnie Wahlberg, Doris Roberts, Dustin Johnson, Dwayne Johnson, Ed Helms, Ed Sheeran\
+50 Cent, Aaron Eckhart, Adriana Lima, Al Pacino, Alan Arkin, Alec Baldwin, Alfonso Ribeiro, Amanda Peet, Andy Dick, Andy Murray, Angelina Jolie, Antoine Griezmann, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bill Clinton, Bill Goldberg, Billy Bob Thornton, Bob Dylan, Bob Marley, Brad Pitt, Brian Van Holt, Bruce Lee, Bryan Cranston, Bud Spencer, Buddy Holly, Chad Lowe, Chris Cornell, Chris Hemsworth, Chris Stapleton, Conor Mcgregor, Cristiano Ronaldo, Daniel Henney, Danny Devito, Danny Glover, Danny Trejo, David Beckham, David Bowie, David Guetta, Debbie Harry, Denise Richards, Donald Trump, Donnie Wahlberg, Doris Roberts, Dr Dre, Dwayne Johnson, Dwyane Wade\
 "
 anchors_map["50_celebrity"]="person"
 contents_map["50_celebrity"]="erase, retain"
 # contents_map["50_celebrity"]="coco"
 
 targets_map["100_celebrity"]="\
-50 Cent, Aaron Eckhart, Adriana Lima, Al Gore, Al Pacino, Alan Arkin, Alec Baldwin, Alfonso Ribeiro, Amanda Peet, Andy Dick, Andy Murray, Angelina Jolie, Antoine Griezmann, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bette Davis, Bill Clinton, Bill Goldberg, Billy Bob Thornton, Bob Dylan, Bob Marley, Brad Pitt, Brian Van Holt, Bruce Lee, Bryan Cranston, Bud Spencer, Buddy Holly, Chad Lowe, Charlie Murphy, Chris Cornell, Chris Hemsworth, Chris Stapleton, Clark Gable, Conor Mcgregor, Cristiano Ronaldo, Daniel Henney, Danny Devito, Danny Glover, Danny Trejo, David Beckham, David Bowie, David Guetta, Debbie Harry, Denise Richards, Dolly Parton, Donald Trump, Donnie Wahlberg, Doris Roberts, Dr Dre, Dustin Johnson, Dwayne Johnson, Dwyane Wade, Ed Helms, Ed Sheeran, Elon Musk, Elton John, Elvis Presley, Eugene Levy, Eugenio Derbez, Fetty Wap, Florence Henderson, Floyd Mayweather, Frances Conroy, Frank Sinatra, Fred Rogers, Frida Kahlo, Garth Brooks, Gary Cooper, George Bush, George Clooney, George Takei, Groucho Marx, Halle Berry, Harry Belafonte, Harry Dean Stanton, Hillary Clinton, Hugh Jackman, Hunter Parrish, Idris Elba, J Balvin, Jack Black, Jack Wagner, Jackie Chan, James Earl Jones, James Harden, Jamie Chung, Jay Leno, Snoop Dogg, Stan Lee, Stephen Colbert, Stephen Hawking, Steve Harvey, Steve Jobs, Stone Cold Steve Austin, Tasha Smith, Theresa May\
+50 Cent, Aaron Eckhart, Adriana Lima, Al Gore, Al Pacino, Alan Arkin, Alec Baldwin, Alfonso Ribeiro, Amanda Peet, Andy Dick, Andy Murray, Angelina Jolie, Antoine Griezmann, Arnold Schwarzenegger, Audrey Hepburn, Barack Obama, Bea Arthur, Benedict Cumberbatch, Bernie Sanders, Bette Davis, Bill Clinton, Bill Goldberg, Billy Bob Thornton, Bob Dylan, Bob Marley, Brad Pitt, Brian Van Holt, Bruce Lee, Bryan Cranston, Bud Spencer, Buddy Holly, Chad Lowe, Charlie Murphy, Chris Cornell, Chris Hemsworth, Chris Stapleton, Clark Gable, Conor Mcgregor, Cristiano Ronaldo, Cynthia Bailey, Daniel Henney, Danny Devito, Danny Glover, Danny Trejo, David Beckham, David Bowie, David Guetta, Debbie Harry, Denise Richards, Dolly Parton, Donald Trump, Donnie Wahlberg, Doris Roberts, Dr Dre, Dustin Johnson, Dwayne Johnson, Dwyane Wade, Ed Helms, Ed Sheeran, Elon Musk, Elton John, Elvis Presley, Eric Wareheim, Eugene Levy, Fetty Wap, Florence Henderson, Floyd Mayweather, Frances Conroy, Frank Sinatra, Fred Rogers, Frida Kahlo, Garth Brooks, Gary Cooper, George Bush, George Clooney, George Takei, Glenn Close, Groucho Marx, Halle Berry, Harry Belafonte, Harry Dean Stanton, Hillary Clinton, Hugh Jackman, Hunter Parrish, Idris Elba, J Balvin, Jack Black, Jack Wagner, Jackie Chan, James Earl Jones, James Harden, Jamie Chung, Jay Leno, Shahrukh Khan, Sheryl Crow, Sheryl Lee Ralph, Shirley Temple, Snoop Dogg, Stan Lee, Stephen Colbert\
 "
 anchors_map["100_celebrity"]="person"
 contents_map["100_celebrity"]="erase, retain"

@@ -40,7 +40,7 @@ def count_nude(det_results):
 def find_root_paths(root_dir, sub_root):
     return sorted(
         list({
-            os.path.abspath(os.path.join(dirpath, ".."))
+            os.path.abspath(dirpath)
             for dirpath, dirnames, _ in os.walk(root_dir)
             if sub_root in dirnames
         })

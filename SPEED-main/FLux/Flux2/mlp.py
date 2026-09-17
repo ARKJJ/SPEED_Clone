@@ -45,7 +45,6 @@ def _trace_concepts(pipeline, concepts, token_indices, module_names, args, devic
                     prompt=concept_batch,
                     generator=generators,
                     num_inference_steps=args.trace_num_steps,
-                    guidance_scale=3.5,
                     height=args.trace_resolution,
                     width=args.trace_resolution,
                     max_sequence_length=max_sequence_length,
@@ -132,16 +131,25 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
             raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
         concept_token_indices[concept] = [token_index]
 
+    full_token_indices = list(range(max_sequence_length))
+
+    def _uses_full_nudity_tokens(concept):
+        return concept.strip().lower() == "nudity"
+
+    use_full_empty_anchor = any(
+        _uses_full_nudity_tokens(concept)
+        for concept in target_concepts
+    )
     target_token_indices = {
-        concept: concept_token_indices[concept]
+        concept: full_token_indices if _uses_full_nudity_tokens(concept) else concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: [0] if concept == "" else concept_token_indices[concept]
+        concept: full_token_indices if concept == "" and use_full_empty_anchor else [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
     retain_token_indices = {
-        concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
+        concept: full_token_indices if concept == "" and use_full_empty_anchor else list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
         for concept in retain_texts
     }
 
@@ -169,8 +177,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 retain_inputs_by_module[module_name].append(torch.cat(retain_inputs, dim=1))
         del retain_traces
     for module_name in module_names:
-        if not retain_inputs_by_module[module_name]:
-            raise RuntimeError(f"No retain trace for {module_name}")
         retain_inputs_by_module[module_name] = torch.cat(retain_inputs_by_module[module_name], dim=1)
 
     edit_dict = {}
@@ -186,8 +192,6 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
 
             sum_target_target = torch.stack([target @ target.T for target in target_inputs]).mean(0)
             sum_target_anchor = torch.stack([anchor @ target.T for target, anchor in zip(target_inputs, anchor_inputs)]).mean(0)
-            sum_target_anchor = sum_target_anchor.to(module.weight.device, torch.float32)
-            sum_target_target = sum_target_target.to(module.weight.device, torch.float32)
             retain_inputs = retain_inputs_by_module[module_name]
 
             weight_before = module.weight.float()
@@ -217,8 +221,8 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=str, default=None)
     parser.add_argument("--chunk_size", type=int, default=128)
     parser.add_argument("--trace_batch_size", type=int, default=4)
-    parser.add_argument("--threshold", type=float, default=3e-2)
-    parser.add_argument("--trace_num_steps", type=int, default=20)
+    parser.add_argument("--threshold", type=float, default=1e-2)
+    parser.add_argument("--trace_num_steps", type=int, default=4)
     parser.add_argument("--trace_seed", type=int, default=0)
     parser.add_argument("--trace_resolution", type=int, default=512)
     parser.add_argument("--update_lambda", type=float, default=1)

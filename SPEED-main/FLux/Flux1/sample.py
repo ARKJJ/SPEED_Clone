@@ -121,7 +121,7 @@ def main():
     parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--mode", type=str, default="original", help="original, edit")
     parser.add_argument("--guidance_scale", type=float, default=3.5)
-    parser.add_argument("--total_timesteps", type=int, default=20, help="The total timesteps of the sampling process")
+    parser.add_argument("--total_timesteps", type=int, default=10, help="The total timesteps of the sampling process")
     parser.add_argument("--num_samples", type=int, default=10, help="The number of samples per prompt to generate")
     parser.add_argument("--batch_size", type=int, default=10, help="Kept for SPEED CLI compatibility")
     parser.add_argument("--prompts", type=str, default=None)

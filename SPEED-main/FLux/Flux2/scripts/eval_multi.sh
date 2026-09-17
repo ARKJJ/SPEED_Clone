@@ -22,7 +22,6 @@ MODE="${MODE:-edit}"
 NUM_SAMPLES="${NUM_SAMPLES:-1}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-20}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.5}"
 MAX_NUM="${MAX_NUM:-}"
 RUN_SCORE="${RUN_SCORE:-0}"
 GCD_SCRIPT="${GCD_SCRIPT:-}"
@@ -131,7 +130,6 @@ run_task() {
     --edit_ckpt "${ckpt_path}"
     --dataset_path "FLux/data/${erase_type}.csv"
     --total_timesteps "${TOTAL_TIMESTEPS}"
-    --guidance_scale "${GUIDANCE_SCALE}"
   )
   if [[ -n "${MAX_NUM}" ]]; then
     sample_args+=(--max_num "${MAX_NUM}")

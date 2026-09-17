@@ -1,10 +1,9 @@
 import argparse
+import copy
 import os
 import random
 import re
 import warnings
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from pathlib import Path
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -66,26 +65,22 @@ def prepare_shared_latents(pipe, seeds, args):
     return latents
 
 
-def flux_generate(pipe, prompts, seeds, args, desc=None, latents_by_seed=None, stream=None):
+def flux_generate(pipe, prompts, seeds, args, desc=None, latents_by_seed=None):
     images = []
-    stream_context = torch.cuda.stream(stream) if stream is not None else nullcontext()
-    with stream_context:
-        for prompt, seed in zip(prompts, seeds):
-            kwargs = dict(
-                prompt=prompt,
-                num_inference_steps=args.total_timesteps,
-                guidance_scale=args.guidance_scale,
-                height=args.height,
-                width=args.width,
-                max_sequence_length=args.max_sequence_length,
-            )
-            if latents_by_seed is None:
-                kwargs["generator"] = torch.Generator(device=pipe.device).manual_seed(int(seed))
-            else:
-                kwargs["latents"] = latents_by_seed[int(seed)].clone()
-            images.append(pipe(**kwargs).images[0])
-    if stream is not None:
-        stream.synchronize()
+    for prompt, seed in zip(prompts, seeds):
+        kwargs = dict(
+            prompt=prompt,
+            num_inference_steps=args.total_timesteps,
+            guidance_scale=args.guidance_scale,
+            height=args.height,
+            width=args.width,
+            max_sequence_length=args.max_sequence_length,
+        )
+        if latents_by_seed is None:
+            kwargs["generator"] = torch.Generator(device=pipe.device).manual_seed(int(seed))
+        else:
+            kwargs["latents"] = latents_by_seed[int(seed)].clone()
+        images.append(pipe(**kwargs).images[0])
     if desc is not None:
         print(f"{desc}: generated {len(images)} images")
     return images
@@ -122,6 +117,26 @@ def combine_images_horizontally(images):
     for i, img in enumerate(images):
         new_img.paste(img, (sum(widths[:i]), 0))
     return new_img
+
+
+def generate_paired_batch(pipe, pipe_edit, prompts, seeds, args, shared_latents, desc_prefix):
+    original_images = flux_generate(
+        pipe=pipe,
+        prompts=prompts,
+        seeds=seeds,
+        args=args,
+        desc=f"{desc_prefix} | original",
+        latents_by_seed=shared_latents,
+    )
+    edit_images = flux_generate(
+        pipe=pipe_edit,
+        prompts=prompts,
+        seeds=seeds,
+        args=args,
+        desc=f"{desc_prefix} | edit",
+        latents_by_seed=shared_latents,
+    )
+    return original_images, edit_images
 
 
 @torch.no_grad()
@@ -190,23 +205,12 @@ def main():
         if not contents:
             return
 
-    paired_mode = "original" in mode_list and "edit" in mode_list
-    if paired_mode:
-        if not args.device.startswith("cuda"):
-            raise ValueError("Paired parallel generation requires a CUDA --device")
+    pipe = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
+    pipe_edit = None
+    if "edit" in mode_list:
         if args.edit_ckpt is None:
             raise ValueError("--edit_ckpt is required when --mode includes edit")
-        pipe_original = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
-        pipe_edit = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
-        load_edit_weights(pipe_edit, args.edit_ckpt)
-        original_stream = torch.cuda.Stream(device=args.device)
-        edit_stream = torch.cuda.Stream(device=args.device)
-    elif "original" in mode_list:
-        pipe_original = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
-    elif "edit" in mode_list:
-        if args.edit_ckpt is None:
-            raise ValueError("--edit_ckpt is required when --mode includes edit")
-        pipe_edit = load_flux_pipeline(model_id, args.device, dtype_map[args.torch_dtype])
+        pipe_edit = copy.deepcopy(pipe) if "original" in mode_list else pipe
         load_edit_weights(pipe_edit, args.edit_ckpt)
 
     def generate_pass(pass_mode, pipe):
@@ -229,35 +233,32 @@ def main():
                 for image, save_filename in zip(images, filenames):
                     image.save(os.path.join(save_path, pass_mode, save_filename))
 
-    def generate_paired():
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            for content in contents:
-                dataset = AdaDataset(content=content, args=args)
-                dataloader = DataLoader(dataset, batch_size=bs, drop_last=False)
-                save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), content)
-                for pass_mode in ("original", "edit"):
-                    os.makedirs(os.path.join(save_path, pass_mode), exist_ok=True)
-                for count, data in enumerate(tqdm(dataloader, desc=f"{content} paired batches")):
-                    prompts = list(data["prompt"])
-                    seeds = [int(x) for x in data["seed"]]
-                    filenames = list(data["filename"])
-                    shared_latents = prepare_shared_latents(pipe_original, seeds, args)
-                    original_future = executor.submit(
-                        flux_generate, pipe_original, prompts, seeds, args,
-                        f"{count * len(prompts)} x prompts | original", shared_latents, original_stream,
-                    )
-                    edit_future = executor.submit(
-                        flux_generate, pipe_edit, prompts, seeds, args,
-                        f"{count * len(prompts)} x prompts | edit", shared_latents, edit_stream,
-                    )
-                    for pass_mode, images in (("original", original_future.result()), ("edit", edit_future.result())):
-                        for image, save_filename in zip(images, filenames):
-                            image.save(os.path.join(save_path, pass_mode, save_filename))
-
-    if paired_mode:
-        generate_paired()
+    if "original" in mode_list and "edit" in mode_list:
+        for content in contents:
+            dataset = AdaDataset(content=content, args=args)
+            dataloader = DataLoader(dataset, batch_size=bs, drop_last=False)
+            save_path = os.path.join(args.save_root, args.target_concept.replace(", ", "_"), content)
+            for pass_mode in ("original", "edit"):
+                os.makedirs(os.path.join(save_path, pass_mode), exist_ok=True)
+            for count, data in enumerate(tqdm(dataloader, desc=f"{content} paired batches")):
+                prompts = list(data["prompt"])
+                seeds = [int(x) for x in data["seed"]]
+                filenames = list(data["filename"])
+                shared_latents = prepare_shared_latents(pipe, seeds, args)
+                original_images, edit_images = generate_paired_batch(
+                    pipe=pipe,
+                    pipe_edit=pipe_edit,
+                    prompts=prompts,
+                    seeds=seeds,
+                    args=args,
+                    shared_latents=shared_latents,
+                    desc_prefix=f"{count * len(prompts)} x prompts",
+                )
+                for pass_mode, images in (("original", original_images), ("edit", edit_images)):
+                    for image, save_filename in zip(images, filenames):
+                        image.save(os.path.join(save_path, pass_mode, save_filename))
     elif "original" in mode_list:
-        generate_pass("original", pipe_original)
+        generate_pass("original", pipe)
     elif "edit" in mode_list:
         generate_pass("edit", pipe_edit)
 

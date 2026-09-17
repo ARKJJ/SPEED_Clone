@@ -26,7 +26,7 @@ DEFAULT_WORK_DIR = FLUX_DIR / "logs" / "gcd_verified"
 COLUMNS = ("id", "type", "text", "concept", "seed")
 TEMPLATES = (
     "A portrait of {}",
-    "An image capturing {} at a public event",
+    "A photo of {}",
     "An oil painting of {}",
     "A sketch of {}",
     "{} in an official photo",
@@ -60,13 +60,13 @@ class Job:
 
 def task_spec(task: str, erase_count: Optional[int] = None) -> TaskSpec:
     if task == "retain":
-        return TaskSpec("retain", "retain", 100, 1, 21, 4, 100, 200)
+        return TaskSpec("retain", "retain", 100, 1, 30, 4, 100, 200)
     if task != "erase" or erase_count not in (10, 50, 100):
         raise ValueError("erase requires --erase-count 10, 50, or 100")
     seeds = {10: 10, 50: 2, 100: 1}[erase_count]
     return TaskSpec(
         f"erase-{erase_count}", "erase", erase_count, seeds,
-        21,
+        30,
         (5 * seeds * 9 + 9) // 10 if erase_count < 100 else 4,
         0, 100,
     )
@@ -336,7 +336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-table", type=Path, default=DEFAULT_LABEL_TABLE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
-    parser.add_argument("--num-inference-steps", type=int, default=20)
+    parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--guidance-scale", type=float, default=3.5)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)

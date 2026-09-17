@@ -21,7 +21,6 @@ NUM_SAMPLES="${NUM_SAMPLES:-20}"
 BATCH_SIZE="${BATCH_SIZE:-20}"
 COCO_NUM_SAMPLES="${COCO_NUM_SAMPLES:-1}"
 TOTAL_TIMESTEPS="${TOTAL_TIMESTEPS:-4}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
 MAX_NUM="${MAX_NUM:-}"
 RUN_SCORE="${RUN_SCORE:-1}"
 SCORE_ONLY="${SCORE_ONLY:-0}"
@@ -117,7 +116,6 @@ run_task() {
         --save_root "${target_root}"
         --edit_ckpt "${ckpt_path}"
         --total_timesteps "${TOTAL_TIMESTEPS}"
-        --guidance_scale "${GUIDANCE_SCALE}"
       )
       if [[ -n "${MAX_NUM}" ]]; then
         sample2_args+=(--max_num "${MAX_NUM}")
@@ -135,8 +133,7 @@ run_task() {
         --batch_size "${BATCH_SIZE}" \
         --save_root "${target_root}" \
         --edit_ckpt "${ckpt_path}" \
-        --total_timesteps "${TOTAL_TIMESTEPS}" \
-        --guidance_scale "${GUIDANCE_SCALE}"
+        --total_timesteps "${TOTAL_TIMESTEPS}"
     fi
   done
 
