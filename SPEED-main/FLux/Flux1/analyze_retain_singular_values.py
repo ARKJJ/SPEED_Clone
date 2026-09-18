@@ -2,7 +2,9 @@
 
 The retain analysis uses every position in the configured sequence, including
 padding positions. With the default ``max_sequence_length=512``, each retain
-prompt contributes all 512 token positions at every traced diffusion step.
+prompt contributes all 512 token positions at every traced diffusion step. The
+retain covariance matches ``mlp.py`` by dividing the accumulated Gram matrix by
+the number of retain concepts, not by the number of traced token columns.
 """
 
 import argparse
@@ -19,6 +21,7 @@ CSV_FIELDS = (
     "layer",
     "matrix_dim",
     "sample_columns",
+    "concept_count",
     "threshold",
     "count_below_threshold",
     "null_space_dim",
@@ -149,6 +152,7 @@ def analyze_retain_set(
     token_indices = _retain_token_indices(pipeline, retain_texts, max_sequence_length)
     second_moment = {name: None for name in module_names}
     sample_columns = {name: 0 for name in module_names}
+    concept_count = {name: 0 for name in module_names}
 
     def accumulate(_concept, concept_trace):
         for name in module_names:
@@ -159,6 +163,7 @@ def analyze_retain_set(
             else:
                 second_moment[name].add_(gram)
             sample_columns[name] += inputs.shape[1]
+            concept_count[name] += 1
             del inputs, gram
 
     _trace_concepts(
@@ -175,7 +180,7 @@ def analyze_retain_set(
     rows = []
     torch_dtype = torch.float64 if svd_dtype == "float64" else torch.float32
     for layer, (name, _module) in enumerate(modules):
-        count = sample_columns[name]
+        count = concept_count[name]
         if second_moment[name] is None or count == 0:
             raise RuntimeError(f"No retain trace for {name}")
         covariance = second_moment[name] / count
@@ -188,7 +193,8 @@ def analyze_retain_set(
                 "module": name,
                 "layer": layer,
                 "matrix_dim": covariance.shape[0],
-                "sample_columns": count,
+                "sample_columns": sample_columns[name],
+                "concept_count": count,
                 "threshold": threshold,
                 "count_below_threshold": summary[f"count_below_{_threshold_label(threshold)}"],
                 "null_space_dim": summary[f"count_below_{_threshold_label(threshold)}"],
@@ -198,7 +204,8 @@ def analyze_retain_set(
                 "max_singular_value": summary["max_singular_value"],
             })
         print(
-            f"{name}: dim={covariance.shape[0]} columns={count} "
+            f"{name}: dim={covariance.shape[0]} columns={sample_columns[name]} "
+            f"concepts={count} "
             f"exact_zero={summary['exact_zero_count']} "
             f"min={summary['min_singular_value']:.6e} "
             f"max={summary['max_singular_value']:.6e}"

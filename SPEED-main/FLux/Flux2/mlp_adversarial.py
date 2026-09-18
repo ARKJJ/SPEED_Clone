@@ -106,17 +106,15 @@ def _load_sparse_weights(pipeline, checkpoint_path):
     print(f"Loaded {len(state_dict)} edited weights from {checkpoint_path}")
 
 
-def _collect_retain_inputs(pipeline, retain_texts, module_names, args, device, max_sequence_length):
-    """Trace retain activations once on the untouched base model and keep them fixed."""
-    full_token_indices = list(range(max_sequence_length))
-    retain_token_indices = {text: full_token_indices for text in retain_texts}
-    retain_inputs_by_module = {module_name: [] for module_name in module_names}
-    for start in range(0, len(retain_texts), args.chunk_size):
-        retain_chunk = retain_texts[start:start + args.chunk_size]
-        retain_traces = _trace_concepts(
+def _collect_concept_inputs(pipeline, concepts, token_indices, module_names, args, device, max_sequence_length):
+    """Trace concept activations once on the untouched base model and keep them fixed."""
+    inputs_by_module = {module_name: [] for module_name in module_names}
+    for start in range(0, len(concepts), args.chunk_size):
+        concept_chunk = concepts[start:start + args.chunk_size]
+        concept_traces = _trace_concepts(
             pipeline,
-            retain_chunk,
-            retain_token_indices,
+            concept_chunk,
+            token_indices,
             module_names,
             args,
             device,
@@ -124,17 +122,61 @@ def _collect_retain_inputs(pipeline, retain_texts, module_names, args, device, m
         )
         for module_name in module_names:
             inputs = [
-                retain_traces[text][module_name]
-                for text in retain_chunk
-                if text in retain_traces
+                concept_traces[concept][module_name]
+                for concept in concept_chunk
+                if concept in concept_traces
             ]
             if inputs:
-                retain_inputs_by_module[module_name].append(torch.cat(inputs, dim=1).cpu())
-    fixed_retain_inputs = {}
-    for module_name, chunks in retain_inputs_by_module.items():
+                inputs_by_module[module_name].append(torch.cat(inputs, dim=1).cpu())
+    fixed_inputs = {}
+    for module_name, chunks in inputs_by_module.items():
         if not chunks:
-            raise RuntimeError(f"No retain trace for {module_name}")
-        fixed_retain_inputs[module_name] = torch.cat(chunks, dim=1)
+            raise RuntimeError(f"No base trace for {module_name}")
+        fixed_inputs[module_name] = torch.cat(chunks, dim=1)
+    return fixed_inputs
+
+
+def _concept_token_indices(pipeline, concepts, max_sequence_length):
+    concept_token_indices = {}
+    for concept in dict.fromkeys(concepts):
+        if concept == "":
+            continue
+        text = pipeline.tokenizer.apply_chat_template(
+            [{"role": "user", "content": concept}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        suffix_text = text.split(concept, 1)[1]
+        suffix_length = int(pipeline.tokenizer(
+            suffix_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).attention_mask[0].sum().item())
+        full_length = int(pipeline.tokenizer(
+            text,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        ).attention_mask[0].sum().item())
+        token_index = full_length - suffix_length - 1
+        if token_index < 0:
+            raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
+        concept_token_indices[concept] = [token_index]
+    return concept_token_indices
+
+
+def _collect_retain_inputs(pipeline, retain_texts, retain_token_indices, module_names, args, device, max_sequence_length):
+    fixed_retain_inputs = _collect_concept_inputs(
+        pipeline,
+        retain_texts,
+        retain_token_indices,
+        module_names,
+        args,
+        device,
+        max_sequence_length,
+    )
     return fixed_retain_inputs
 
 
@@ -143,6 +185,7 @@ def edit_model(
     base_weights,
     pipeline,
     target_concept,
+    base_target_inputs_by_module,
     base_retain_inputs_by_module,
     device="cuda:0",
     max_sequence_length=512,
@@ -154,19 +197,18 @@ def edit_model(
         layer_index = int(re.match(r"transformer_blocks\.(\d+)\.", module_name).group(1))
         grouped_modules.setdefault(layer_index, []).append((module_name, module))
 
-    full_token_indices = list(range(max_sequence_length))
-    target_token_indices = {target_concept: full_token_indices}
-    empty_token_indices = {"": full_token_indices}
+    empty_token_indices = {"": [0]}
     edit_dict = {}
 
     for _layer_index, layer_modules in sorted(grouped_modules.items()):
         layer_module_names = [module_name for module_name, _module in layer_modules]
-        target_traces = _trace_concepts(pipeline, [target_concept], target_token_indices, layer_module_names, args, device, max_sequence_length)
         empty_traces = _trace_concepts(pipeline, [""], empty_token_indices, layer_module_names, args, device, max_sequence_length)
         for module_name, module in layer_modules:
             if module_name not in base_retain_inputs_by_module:
                 raise RuntimeError(f"No retain trace for {module_name}")
-            target_inputs = target_traces[target_concept][module_name]
+            if module_name not in base_target_inputs_by_module:
+                raise RuntimeError(f"No base target trace for {module_name}")
+            target_inputs = base_target_inputs_by_module[module_name]
             empty_inputs = empty_traces[""][module_name]
             adversarial_inputs = _adversarial_inputs(
                 target_inputs,
@@ -232,9 +274,25 @@ if __name__ == "__main__":
         for name, module in _select_edit_modules(base_pipeline)
     }
     retain_texts = _load_retain_texts(args.retain_path, args.heads, args.target_concept)
+    base_target_token_indices = _concept_token_indices(base_pipeline, [args.target_concept], 512)
+    retain_concept_token_indices = _concept_token_indices(base_pipeline, retain_texts, 512)
+    retain_token_indices = {
+        text: list(range(1, 512)) if text == "" else retain_concept_token_indices[text]
+        for text in retain_texts
+    }
+    base_target_inputs_by_module = _collect_concept_inputs(
+        base_pipeline,
+        [args.target_concept],
+        base_target_token_indices,
+        base_module_names,
+        args,
+        args.device,
+        512,
+    )
     base_retain_inputs_by_module = _collect_retain_inputs(
         base_pipeline,
         retain_texts,
+        retain_token_indices,
         base_module_names,
         args,
         args.device,
@@ -252,6 +310,7 @@ if __name__ == "__main__":
         base_weights,
         pipeline,
         args.target_concept,
+        base_target_inputs_by_module,
         base_retain_inputs_by_module,
         args.device,
         512,

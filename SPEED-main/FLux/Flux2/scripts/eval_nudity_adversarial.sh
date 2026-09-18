@@ -27,15 +27,22 @@ MLP_RUN_NAME="${MLP_RUN_NAME:-nudity_to_null_mlp_flux2_t${TRACE_NUM_STEPS}_thr${
 if [[ -z "${MLP_CKPT+x}" ]]; then
   MLP_CKPT="${EDITED_CKPT:-${CHECKPOINT_DIR}/${MLP_RUN_NAME}.safetensors}"
 fi
+ADVERSARIAL_INPUT_CKPT="${ADVERSARIAL_INPUT_CKPT:-}"
 ROBUST_CKPT="${CHECKPOINT_DIR}/${RUN_NAME}.safetensors"
-SAVE_ROOT_ORIGINAL="${SAVE_ROOT_ORIGINAL:-logs/FLUX2/${RUN_NAME}_original}"
-SAVE_ROOT_MLP="${SAVE_ROOT_MLP:-logs/FLUX2/${RUN_NAME}_mlp}"
-SAVE_ROOT_ADVERSARIAL="${SAVE_ROOT_ADVERSARIAL:-logs/FLUX2/${RUN_NAME}_adversarial}"
+SAVE_ROOT_ADVERSARIAL="${SAVE_ROOT_ADVERSARIAL:-logs/FLUX2/new2${RUN_NAME}_adversarial}"
 
-mkdir -p "${CHECKPOINT_DIR}" "${SAVE_ROOT_ORIGINAL}" "${SAVE_ROOT_MLP}" "${SAVE_ROOT_ADVERSARIAL}"
+mkdir -p "${CHECKPOINT_DIR}" "${SAVE_ROOT_ADVERSARIAL}"
 
-if [[ ! -f "${MLP_CKPT}" ]]; then
-  echo "1/3 Generating ordinary MLP-erased checkpoint: ${MLP_CKPT}"
+if [[ -n "${ADVERSARIAL_INPUT_CKPT}" ]]; then
+  EDITED_INPUT_CKPT="${ADVERSARIAL_INPUT_CKPT}"
+  echo "1/3 Continuing adversarial update from: ${EDITED_INPUT_CKPT}"
+  if [[ ! -f "${EDITED_INPUT_CKPT}" ]]; then
+    echo "Adversarial input checkpoint does not exist: ${EDITED_INPUT_CKPT}" >&2
+    exit 1
+  fi
+else
+  EDITED_INPUT_CKPT="${MLP_CKPT}"
+  echo "1/3 Regenerating ordinary MLP-erased checkpoint: ${EDITED_INPUT_CKPT}"
   CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" mlp.py \
     --sd_ckpt "${SD_CKPT}" \
     --device "cuda:0" \
@@ -46,16 +53,16 @@ if [[ ! -f "${MLP_CKPT}" ]]; then
     --trace_num_steps "${TRACE_NUM_STEPS}" \
     --threshold "${MLP_THRESHOLD}" \
     --update_lambda "${UPDATE_LAMBDA}"
-fi
-if [[ ! -f "${MLP_CKPT}" ]]; then
-  echo "Ordinary MLP checkpoint was not created: ${MLP_CKPT}" >&2
-  exit 1
+  if [[ ! -f "${EDITED_INPUT_CKPT}" ]]; then
+    echo "Ordinary MLP checkpoint was not created: ${EDITED_INPUT_CKPT}" >&2
+    exit 1
+  fi
 fi
 
 echo "2/3 Generating adversarially re-edited checkpoint: ${ROBUST_CKPT}"
 CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" mlp_adversarial.py \
   --sd_ckpt "${SD_CKPT}" \
-  --edited_ckpt "${MLP_CKPT}" \
+  --edited_ckpt "${EDITED_INPUT_CKPT}" \
   --device "cuda:0" \
   --target_concept "nudity" \
   --save_path "${CHECKPOINT_DIR}" \
@@ -85,11 +92,11 @@ run_sampling() {
   --total_timesteps "${TOTAL_TIMESTEPS}"
   --max_sequence_length "${MAX_SEQUENCE_LENGTH}"
   )
+  if [[ -z "${checkpoint_path}" || ! -f "${checkpoint_path}" ]]; then
+    echo "Edit checkpoint is required for mode=${mode}: ${checkpoint_path}" >&2
+    exit 1
+  fi
   if [[ "${mode}" != "original" ]]; then
-    if [[ -z "${checkpoint_path}" || ! -f "${checkpoint_path}" ]]; then
-      echo "Edit checkpoint is required for mode=${mode}: ${checkpoint_path}" >&2
-      exit 1
-    fi
     sample_args+=(--edit_ckpt "${checkpoint_path}")
   fi
   if [[ -n "${MAX_NUM}" ]]; then
@@ -105,7 +112,5 @@ run_sampling() {
   done
 }
 
-echo "3/3 Sampling original, ordinary MLP, and adversarial outputs"
-run_sampling "" "${SAVE_ROOT_ORIGINAL}" "original" "original"
-run_sampling "${MLP_CKPT}" "${SAVE_ROOT_MLP}" "edit" "edit"
+echo "3/3 Sampling adversarial outputs"
 run_sampling "${ROBUST_CKPT}" "${SAVE_ROOT_ADVERSARIAL}" "edit" "edit"

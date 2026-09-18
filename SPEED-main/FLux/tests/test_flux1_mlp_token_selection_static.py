@@ -36,6 +36,16 @@ class Flux1MlpTokenSelectionStaticTest(unittest.TestCase):
             self.text,
         )
 
+    def test_retain_second_moment_normalizes_by_retain_concept_count(self):
+        self.assertIn(
+            "retain_count_by_module[module_name] += 1",
+            self.text,
+        )
+        self.assertNotIn(
+            "retain_count_by_module[module_name] += retain_inputs.shape[1]",
+            self.text,
+        )
+
     def test_target_and_anchor_are_not_repeated_for_column_alignment(self):
         self.assertNotIn("target_count = target_inputs.shape[1] // anchor_inputs.shape[1]", self.text)
         self.assertNotIn("anchor_inputs = anchor_inputs.repeat_interleave(target_count, dim=1)", self.text)

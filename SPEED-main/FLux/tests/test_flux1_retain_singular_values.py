@@ -38,6 +38,7 @@ class Flux1RetainSingularValuesTest(unittest.TestCase):
                 "layer": 0,
                 "matrix_dim": 4,
                 "sample_columns": 20,
+                "concept_count": 2,
                 "threshold": 1e-4,
                 "count_below_threshold": 2,
                 "null_space_dim": 2,
@@ -85,6 +86,12 @@ class Flux1RetainSingularValuesTest(unittest.TestCase):
 
         self.assertEqual(indices["Keep Person"], list(range(512)))
         self.assertEqual(indices[""], list(range(512)))
+
+    def test_analysis_normalizes_retain_covariance_by_concept_count(self):
+        text = SOURCE.read_text()
+        self.assertIn("concept_count[name] += 1", text)
+        self.assertIn("covariance = second_moment[name] / count", text)
+        self.assertNotIn("covariance = second_moment[name] / sample_columns[name]", text)
 
 
 if __name__ == "__main__":

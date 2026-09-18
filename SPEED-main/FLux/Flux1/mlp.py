@@ -120,7 +120,7 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
                 retain_second_moment_by_module[module_name] = retain_matrix
             else:
                 retain_second_moment_by_module[module_name].add_(retain_matrix)
-            retain_count_by_module[module_name] += retain_inputs.shape[1]
+            retain_count_by_module[module_name] += 1
             del retain_inputs
 
     trace_concepts(retain_texts, retain_token_indices, module_names, on_concept_trace=accumulate_retain_trace)

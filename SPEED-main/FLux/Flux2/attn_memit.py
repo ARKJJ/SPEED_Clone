@@ -96,6 +96,37 @@ def _closed_form_update(residual_target, target_target, update_lambda, retain_in
     return torch.linalg.solve(system.T, (residual_target @ projector).T).T
 
 
+def _concept_token_indices(pipeline, concepts, max_sequence_length):
+    concept_token_indices = {}
+    for concept in dict.fromkeys(concepts):
+        if concept == "":
+            continue
+        text = pipeline.tokenizer.apply_chat_template(
+            [{"role": "user", "content": concept}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        suffix_text = text.split(concept, 1)[1]
+        suffix_length = int(pipeline.tokenizer(
+            suffix_text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).attention_mask[0].sum().item())
+        full_length = int(pipeline.tokenizer(
+            text,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        ).attention_mask[0].sum().item())
+        token_index = full_length - suffix_length - 1
+        if token_index < 0:
+            raise RuntimeError(f"Prompt token for {concept!r} was truncated by max_sequence_length={max_sequence_length}.")
+        concept_token_indices[concept] = [token_index]
+    return concept_token_indices
+
+
 def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, device="cuda:0", max_sequence_length=512):
     selected_params = list(args.params)
     edit_modules = []
@@ -135,17 +166,22 @@ def edit_model(args, pipeline, target_concepts, anchor_concepts, retain_texts, d
         if modules
     }
 
-    full_token_indices = list(range(max_sequence_length))
+    non_empty_concepts = [
+        concept
+        for concept in dict.fromkeys(target_concepts + anchor_concepts + retain_texts)
+        if concept != ""
+    ]
+    concept_token_indices = _concept_token_indices(pipeline, non_empty_concepts, max_sequence_length)
     target_token_indices = {
-        concept: full_token_indices
+        concept: concept_token_indices[concept]
         for concept in target_concepts
     }
     anchor_token_indices = {
-        concept: full_token_indices
+        concept: [0] if concept == "" else concept_token_indices[concept]
         for concept in anchor_concepts
     }
     retain_token_indices = {
-        concept: full_token_indices
+        concept: list(range(1, max_sequence_length)) if concept == "" else concept_token_indices[concept]
         for concept in retain_texts
     }
 
